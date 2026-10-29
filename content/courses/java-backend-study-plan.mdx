@@ -1,0 +1,93 @@
+---
+title: "A Six-Week Java Backend Study Plan"
+description: "What to study, in what order, and what to build so the knowledge sticks."
+order: 1
+difficulty: intermediate
+tags: ["study plan", "backend", "interview prep"]
+updated: "2026-10-18"
+sources:
+  - title: "Dev.java — Learn Java"
+    href: "https://dev.java/learn/"
+  - title: "Spring Boot Reference Documentation"
+    href: "https://docs.spring.io/spring-boot/reference/"
+  - title: "JLS §17 — Threads and Locks (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html"
+---
+
+<Lead>
+Reading without building does not survive an interview. Each week below has one reading track and
+one artefact you can show and defend.
+</Lead>
+
+## Week 1 — Language semantics
+
+**Read:** object model and dispatch, generics and erasure, equals/hashCode and records.
+
+**Build:** a small value-type library — money, date range, version — with correct `equals`,
+`hashCode`, `compareTo`, validation in compact constructors, and tests for symmetry and
+transitivity.
+
+**Check yourself:** explain why `List<Integer>` is not a `List<Number>`, and why a mutable map key
+disappears.
+
+## Week 2 — Collections and strings
+
+**Read:** HashMap internals, choosing a collection, immutability and strings.
+
+**Build:** a bounded LRU cache on `LinkedHashMap`, plus a benchmark comparing `ArrayList` and
+`LinkedList` for iteration and middle inserts. Write down the numbers.
+
+**Check yourself:** derive HashMap's default capacity and load factor behaviour from first
+principles, then explain treeification thresholds.
+
+## Week 3 — Concurrency
+
+**Read:** race conditions and locks, threads and executors.
+
+**Build:** a rate limiter, first with `synchronized`, then with a `Semaphore`, then with atomics.
+Write a test that fails without synchronisation and passes with it.
+
+**Check yourself:** define happens-before without hand-waving, and explain why a virtual thread does
+not make CPU-bound code faster.
+
+## Week 4 — JVM and performance
+
+**Read:** class loading and bytecode, garbage collection in practice.
+
+**Build:** a service that allocates deliberately, run it under `-Xlog:gc*`, capture a heap dump with
+`jcmd`, and write a one-page diagnosis of what you saw.
+
+**Check yourself:** read a GC log line out loud and say which number indicates a leak.
+
+## Week 5 — Spring Boot and SQL
+
+**Read:** the request lifecycle, indexes and query plans.
+
+**Build:** a REST endpoint with validation, a `@ControllerAdvice`, a transactional service, and one
+query that you tune with `EXPLAIN (ANALYZE, BUFFERS)` before and after adding an index.
+
+**Check yourself:** explain why self-invocation bypasses `@Transactional`, and why a function call
+around a column prevents index use.
+
+## Week 6 — Reliability and interviews
+
+**Read:** idempotency and retries, the interview bank, the revision sheet.
+
+**Build:** add an idempotency key to the endpoint from week 5, including the unique constraint, the
+stored response and a concurrent-duplicate test.
+
+**Check yourself:** answer twenty questions from the bank out loud, in under two minutes each.
+
+## How to study
+
+- Read one chapter, then close it and write the mechanism from memory. The gap is what to re-read.
+- Every claim you make in an interview should have a debugging story behind it.
+- Prefer one artefact you can explain deeply over five tutorials you copied.
+- Keep a running list of "things I assumed and was wrong about" — that list is your revision sheet.
+
+<KeyPoints>
+- Pair every reading block with a small artefact you can defend.
+- Measure: benchmarks, GC logs, query plans. Numbers beat intuition.
+- Explain mechanisms out loud; recognition is not recall.
+- Revisit the revision sheet weekly rather than cramming before the interview.
+</KeyPoints>

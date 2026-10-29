@@ -1,0 +1,172 @@
+---
+title: "The Spring Boot Request Lifecycle"
+description: "From embedded Tomcat to your controller: filters, interceptors, proxies, validation and where transactions really begin."
+order: 1
+difficulty: intermediate
+tags: ["Spring Boot", "filters", "transactions", "proxies"]
+updated: "2026-10-20"
+sources:
+  - title: "Spring Framework Reference — Web MVC"
+    href: "https://docs.spring.io/spring-framework/reference/web/webmvc.html"
+    note: "DispatcherServlet, handler mapping and the filter chain."
+  - title: "Spring Boot Reference Documentation"
+    href: "https://docs.spring.io/spring-boot/reference/"
+    note: "Auto-configuration, embedded server and application lifecycle."
+  - title: "Jakarta Servlet 6.0 Specification"
+    href: "https://jakarta.ee/specifications/servlet/6.0/"
+    note: "The container contract Spring MVC runs on."
+---
+
+<Lead>
+Most Spring surprises disappear once you can draw the chain a request travels. This is that chain,
+with the two proxy boundaries that cause the majority of production bugs marked.
+</Lead>
+
+## The path of one request
+
+```text
+client
+  │
+  ▼
+embedded Tomcat ──► FilterChain ──► DispatcherServlet
+                                       │
+                                       ├─► HandlerInterceptor.preHandle
+                                       ├─► HandlerAdapter ──► @Controller (proxy)
+                                       │                        │
+                                       │                        ├─► @Transactional (proxy)
+                                       │                        └─► repository
+                                       ├─► HandlerInterceptor.postHandle
+                                       └─► afterCompletion / @ControllerAdvice on error
+```
+
+| Layer | Belongs to | Can see | Typical use |
+| --- | --- | --- | --- |
+| Filter | Servlet container | raw request/response | security, CORS, request ids, compression |
+| Interceptor | Spring MVC | handler metadata | auth checks, locale, timing |
+| `@ControllerAdvice` | Spring MVC | exceptions | map domain errors to HTTP |
+| AOP advice | Spring proxy | method invocation | transactions, caching, metrics |
+
+Filters run outside the Spring bean graph, so `@Autowired` in a filter works only because Spring
+registers a delegating filter — and ordering relative to security filters must be explicit.
+
+## The DispatcherServlet
+
+It resolves a handler through `HandlerMapping`, adapts it through a `HandlerAdapter`, then resolves
+the return value. `@RestController` writes the body through an `HttpMessageConverter`; `@Controller`
+resolves a view name. `ResponseEntity` carries status, headers and body explicitly.
+
+Content negotiation picks the converter from the `Accept` header. A missing `jackson-databind`
+dependency is the usual reason JSON endpoints return 406.
+
+## The transaction proxy boundary
+
+`@Transactional` works through a proxy: the call must enter the bean from outside.
+
+```java
+@Service
+public class OrderService {
+    @Transactional
+    public void place(Order order) {
+        persist(order);
+        audit(order);          // same class, no proxy — @Transactional on audit() is ignored
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void audit(Order order) { ... }
+}
+```
+
+Calling `audit()` on `this` bypasses the proxy, so it joins the existing transaction (or runs without
+one if none exists). Fixes: split into another bean, inject a self-reference, or use
+`TransactionTemplate` for programmatic control.
+
+<Callout type="warning" title="Rollback rules">
+By default, Spring rolls back on unchecked exceptions only. A checked exception leaves the
+transaction committed unless you declare `rollbackFor`. Also, catching an exception inside the
+transactional method means Spring never sees it and commits.
+</Callout>
+
+## Validation and binding
+
+`@Valid` on a `@RequestBody` triggers Bean Validation before the method body runs;
+`@Validated` on the class enables method-level validation for `@RequestParam` and friends. Failures
+become `MethodArgumentNotValidException`, which a `@ControllerAdvice` should map to a 400 with field
+details — not a stack trace.
+
+```java
+@PostMapping("/orders")
+ResponseEntity<OrderResponse> create(@Valid @RequestBody OrderRequest request) { ... }
+
+@ExceptionHandler(MethodArgumentNotValidException.class)
+ResponseEntity<ApiError> onInvalid(MethodArgumentNotValidException ex) {
+    var fields = ex.getBindingResult().getFieldErrors().stream()
+            .collect(toMap(FieldError::getField, FieldError::getDefaultMessage, (a, b) -> a));
+    return ResponseEntity.badRequest().body(new ApiError("validation_failed", fields));
+}
+```
+
+## Where the connection is actually held
+
+A transaction binds a connection to the thread for its duration. Long-running work inside a
+transaction — an HTTP call, a file write, a slow query — holds that connection and blocks the pool.
+Keep transactions short, and move external calls outside them.
+
+```java
+@Transactional
+public void handle(Long id) {
+    Order order = repository.find(id);       // DB work
+    paymentClient.charge(order);             // network call inside the transaction — avoid
+}
+```
+
+<Callout type="note" title="Read-only is not just documentation">
+`@Transactional(readOnly = true)` lets Hibernate skip dirty checking and can route to a read
+replica. It does not prevent writes in every setup, but it is a useful signal and a real
+optimisation.
+</Callout>
+
+## Startup and configuration
+
+`@SpringBootApplication` combines component scanning, auto-configuration and configuration
+properties. Auto-configuration is conditional: each starter contributes `@ConditionalOnClass` /
+`@ConditionalOnMissingBean` decisions, which is why adding a dependency can silently replace a bean
+you defined. `--debug` prints the condition evaluation report.
+
+Profiles should switch *infrastructure*, not business logic. Configuration belongs in typed
+`@ConfigurationProperties` records, validated at startup, rather than scattered `@Value` strings.
+
+<KeyPoints>
+- Filters run before Spring MVC; interceptors run inside it with handler metadata.
+- `@Transactional`, `@Cacheable` and `@Async` only apply through the proxy — self-invocation bypasses them.
+- Rollback defaults to unchecked exceptions; catching inside the method prevents rollback.
+- Keep transactions short; never hold a connection across a remote call.
+- Bean Validation failures should be mapped to a 400 in a `@ControllerAdvice`.
+- Auto-configuration is conditional; `--debug` shows why a bean was or was not created.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="Why does @Transactional not work on a private method?" level="mid">
+The proxy cannot override a private method, so no advice can run. The same applies to `final`
+methods and `final` classes with class-based proxies. Make the method public on a proxied bean, or
+use programmatic transactions.
+</Interview>
+
+<Interview question="Filter vs interceptor vs AOP — when do you choose each?" level="senior">
+Filters for concerns that must run before Spring MVC or need the raw servlet request (security, CORS,
+request ids). Interceptors when you need handler metadata or MVC lifecycle hooks. AOP for
+cross-cutting behaviour around bean methods, especially when it must apply outside HTTP, such as
+scheduled jobs.
+</Interview>
+
+<Interview question="What does propagation REQUIRES_NEW do?" level="senior">
+It suspends the current transaction and starts an independent one with its own connection and
+commit/rollback. Use it for audit logging that must survive a rollback of the outer transaction.
+Caution: it consumes an extra connection and can deadlock against the suspended transaction's locks.
+</Interview>
+
+<Interview question="How does Spring decide which exception maps to which HTTP status?" level="mid">
+`@ExceptionHandler` methods in a `@ControllerAdvice` are matched by exception type, most specific
+first. `@ResponseStatus` on the exception is a fallback. Without either, the container default
+applies (500). Domain exceptions mapped centrally keep controllers free of error plumbing.
+</Interview>
+</InterviewSet>

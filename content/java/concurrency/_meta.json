@@ -1,0 +1,5 @@
+{
+  "title": "Concurrency",
+  "description": "The Java memory model, race conditions, locks, executors and the structured concurrency APIs that replaced hand-rolled thread management.",
+  "order": 3
+}

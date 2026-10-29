@@ -1,0 +1,161 @@
+---
+title: "Class Loading, Bytecode and the JIT"
+description: "From .java to native code: loading, linking, the interpreter, tiered compilation and deoptimisation."
+order: 1
+difficulty: advanced
+tags: ["JVM", "bytecode", "JIT", "class-loading"]
+updated: "2026-10-23"
+sources:
+  - title: "JVMS §5 — Loading, Linking, and Initializing (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-5.html"
+  - title: "JVMS §2 — The Structure of the Java Virtual Machine (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html"
+  - title: "jcmd (JDK 21 tool reference)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/specs/man/jcmd.html"
+  - title: "Dev.java — The JVM"
+    href: "https://dev.java/learn/jvm/"
+---
+
+<Lead>
+Java is not "compiled once, run slowly". It is compiled to bytecode, interpreted while it warms up,
+then recompiled by the JIT with assumptions based on what the program actually does.
+</Lead>
+
+## The pipeline
+
+```text
+.java ──javac──► .class (bytecode) ──class loader──► linked ──interpreter──► native code
+                                                        │
+                                                        └──JIT (C1/C2)──► optimised machine code
+```
+
+1. **Loading** — find the bytes, define the class, create the `Class` object.
+2. **Linking** — verification (bytecode safety), preparation (static fields to defaults), resolution
+   (symbolic references to direct ones, often lazy).
+3. **Initialisation** — run `<clinit>`, the static initialiser, exactly once, on first active use.
+
+## The class loader hierarchy
+
+| Loader | Loads | Notes |
+| --- | --- | --- |
+| Bootstrap | `java.base`, core JDK | native, no `ClassLoader` object in older APIs |
+| Platform | JDK modules like `java.sql` | replaced the extension loader in Java 9 |
+| Application | classpath / module path | your code |
+| Custom | plugins, containers | must define `findClass`, not break delegation |
+
+Parent-first delegation means a class is requested from the parent before the child, which prevents
+applications from shadowing `java.lang.String`. Containers deliberately break this (Tomcat's webapp
+loaders) to isolate applications. Two classes with the same name loaded by different loaders are
+different types and cannot be cast to one another.
+
+```java
+Class<?> a = loaderA.loadClass("com.acme.Widget");
+Class<?> b = loaderB.loadClass("com.acme.Widget");
+a == b;   // false — different loaders, different types
+```
+
+<Callout type="warning" title="Class loader leaks">
+A webapp redeploy holds its loader alive if any thread, `ThreadLocal`, JDBC driver or static field
+still references a class from it. The classic symptom is `OutOfMemoryError: Metaspace` after several
+redeploys.
+</Callout>
+
+## Reading bytecode
+
+`javap -c -p` is the fastest way to settle arguments about what the compiler did.
+
+```java
+int add(int a, int b) { return a + b; }
+```
+
+```text
+0: iload_1
+1: iload_2
+2: iadd
+3: ireturn
+```
+
+Things bytecode makes obvious:
+
+- String concatenation became `invokedynamic` (`makeConcatWithConstants`), not `StringBuilder`.
+- Lambdas became `invokedynamic` linked to `LambdaMetafactory`; there is no anonymous class.
+- Generics are gone; casts appear where the compiler inserts them.
+- A `switch` on a String compiles to `hashCode()` plus a lookup, not a sequence of `equals`.
+
+## Tiered compilation
+
+HotSpot starts in the interpreter, profiles the code, then compiles with C1 (fast, lightly
+optimised) and later C2 (slow compile, aggressive optimisation). This is why benchmarks need warmup
+and why the first request is slow.
+
+The JIT optimises based on observed types:
+
+- **Inlining** — small hot methods are pasted into callers, enabling further optimisation.
+- **Monomorphic dispatch** — a call site that always sees one receiver type is devirtualised.
+- **Escape analysis** — objects that never escape may be scalar-replaced and not allocated.
+- **Loop unrolling**, dead code elimination, constant folding.
+
+When an assumption breaks, the JVM **deoptimises** and falls back to the interpreter, then
+recompiles. Code that is fast in a microbenchmark can be slow in production if its call sites are
+polymorphic.
+
+<Callout type="java" title="Reading -XX:+PrintCompilation">
+Log lines like `3 45 % 4 com.acme.Service::handle @ 12 (156 bytes)` mean: compile id 3, tier 4 (C2),
+`%` indicates on-stack replacement, method and bytecode size. Frequent deoptimisation messages
+(`made not entrant`) point at unstable type profiles.
+</Callout>
+
+## Diagnostic commands
+
+| Command | Purpose |
+| --- | --- |
+| `jps -l` | find JVM processes |
+| `jcmd <pid> VM.flags` | effective JVM flags |
+| `jcmd <pid> GC.heap_info` | heap usage by generation |
+| `jcmd <pid> Thread.print` | thread dump |
+| `jcmd <pid> JFR.start` | start Java Flight Recorder |
+| `javap -c -p Class` | disassemble bytecode |
+
+## Ahead-of-time and GraalVM
+
+JIT gives peak throughput after warmup. AOT (GraalVM Native Image, Project Leyden's CDS/AOT cache)
+trades peak performance and dynamic features for instant startup and low memory. Reflection,
+dynamic proxies and resources need explicit configuration in native images — the closed-world
+assumption removes classes nobody statically referenced.
+
+<KeyPoints>
+- Loading, linking and initialisation are distinct; `<clinit>` runs once on first active use.
+- Parent-first delegation prevents shadowing JDK classes; separate loaders create separate types.
+- Bytecode reveals compiler desugaring: `invokedynamic` for lambdas and string concatenation.
+- Tiered compilation interprets, then C1, then C2, using runtime type profiles.
+- Deoptimisation happens when a speculative assumption fails; polymorphic call sites hurt.
+- AOT improves startup at the cost of peak throughput and dynamic behaviour.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="When is a class initialised?" level="mid">
+On first active use: creating an instance, accessing a static field (not a compile-time constant),
+calling a static method, or reflectively instantiating. Referencing a `static final` primitive or
+String constant does not trigger it because the value is inlined at compile time.
+</Interview>
+
+<Interview question="Why do two identical classes fail to cast across class loaders?" level="senior">
+A runtime type is identified by its fully qualified name *and* its defining loader. The same bytes
+defined by two loaders produce two distinct `Class` objects, so the casts fail with
+`ClassCastException` even though the source is identical. This is the root of many container and
+plugin isolation bugs.
+</Interview>
+
+<Interview question="What is deoptimisation?" level="senior">
+The JIT compiles based on observed profiles, for example assuming a call site is monomorphic. If a
+new type appears, the compiled code is marked not-entrant, execution falls back to the interpreter,
+and the method is recompiled with the new profile. Benchmarks that ignore this measure warmup
+behaviour.
+</Interview>
+
+<Interview question="What does invokedynamic do for lambdas?" level="mid">
+`javac` emits an `invokedynamic` call site with `LambdaMetafactory` as the bootstrap. On first
+execution, the JVM links a generated class implementing the functional interface. This avoids a
+class file per lambda and lets the runtime choose an implementation strategy.
+</Interview>
+</InterviewSet>

@@ -1,0 +1,199 @@
+---
+title: "Exceptions and Resource Management"
+description: "Checked versus unchecked, what try-with-resources really does, and how to preserve the original failure."
+order: 5
+difficulty: intermediate
+tags: ["exceptions", "try-with-resources", "error-handling"]
+updated: "2026-10-22"
+sources:
+  - title: "JLS §11 — Exceptions (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-11.html"
+  - title: "JLS §14 — Blocks, Statements, and Patterns (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-14.html"
+    note: "try-with-resources and suppressed exceptions."
+  - title: "java.lang.Throwable (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Throwable.html"
+---
+
+<Lead>
+Exception handling is where API design and operational debugging meet. The rules are small: know
+which failures are recoverable, never lose the cause, and let the language close resources for you.
+</Lead>
+
+## The hierarchy, and what each branch means
+
+```text
+Throwable
+├── Error                 — JVM-level, do not catch (OutOfMemoryError, StackOverflowError)
+└── Exception
+    ├── RuntimeException  — unchecked: programming errors, contract violations
+    └── (everything else) — checked: recoverable conditions the caller must handle
+```
+
+Checked exceptions are part of the method signature, so callers cannot forget them. Unchecked
+exceptions signal bugs — a null, an invalid index, an illegal argument — and should generally not
+be caught except at a boundary that converts them into a response.
+
+```java
+// checked: the caller must decide
+String read(String path) throws IOException;
+
+// unchecked: the caller must fix the call
+int divide(int a, int b) {
+    if (b == 0) throw new ArithmeticException("division by zero");
+    return a / b;
+}
+```
+
+<Callout type="warning" title="Do not catch `Exception` to be safe">
+Catching `Exception` also catches `RuntimeException`, hiding bugs and swallowing failures that
+should reach the top-level handler. Catch the narrowest type you can actually handle, and rethrow
+everything else.
+</Callout>
+
+## try-with-resources
+
+Any `AutoCloseable` declared in the resource header is closed automatically, in reverse order, even
+when the body throws.
+
+```java
+try (var in = Files.newInputStream(source);
+     var out = Files.newOutputStream(target)) {
+    in.transferTo(out);
+}
+```
+
+The compiler generates a null check, a try/finally, and suppression handling. If the body throws
+*and* `close()` throws, the close failure is attached to the original as a **suppressed** exception
+rather than replacing it.
+
+```java
+try (var resource = new FailingResource()) {
+    throw new IllegalStateException("body failed");
+}
+// IllegalStateException is the thrown exception
+// e.getSuppressed()[0] is the exception from close()
+```
+
+That is a real improvement over the manual pattern, which silently loses the body exception:
+
+```java
+Resource resource = new Resource();
+try {
+    throw new IllegalStateException("body failed");
+} finally {
+    resource.close();   // if this throws, the body exception disappears
+}
+```
+
+<Callout type="note" title="Suppressed exceptions still need logging">
+Frameworks often log only the primary exception. If a connection pool close failure matters, log
+`getSuppressed()` explicitly at the boundary.
+</Callout>
+
+## Custom exceptions
+
+```java
+public class PaymentDeclinedException extends RuntimeException {
+    private final String declineCode;
+
+    public PaymentDeclinedException(String declineCode, Throwable cause) {
+        super("payment declined: " + declineCode, cause);  // message + cause, always both
+        this.declineCode = declineCode;
+    }
+
+    public String declineCode() { return declineCode; }
+}
+```
+
+Rules that keep stack traces useful:
+
+- Pass the cause to `super(message, cause)`. Never `throw new X(e.getMessage())`.
+- Do not log and rethrow at every layer — log once, at the boundary that handles it.
+- Do not use exceptions for expected control flow inside loops; they are expensive and hide intent.
+- Include the offending value in the message, but never secrets, tokens or full request bodies.
+- Do not return `null` to signal failure when a checked exception or `Optional` communicates it.
+
+## Multi-catch and precise rethrow
+
+```java
+try {
+    return mapper.readValue(json, Order.class);
+} catch (JsonProcessingException | IllegalArgumentException e) {
+    throw new BadRequestException("invalid order payload", e);
+}
+```
+
+Multi-catch alternatives must not be subtypes of one another, and the caught variable is implicitly
+final. Precise rethrow lets a helper preserve the declared checked exception types:
+
+```java
+static <T> T wrap(Callable<T> task) throws IOException, InterruptedException {
+    try {
+        return task.call();
+    } catch (Exception e) {
+        throw e;   // compiler analyses the try body: only IOException/InterruptedException escape
+    }
+}
+```
+
+## Exceptions in constructors and static initialisers
+
+A constructor that throws leaves no object, but it may leave side effects: files opened, listeners
+registered, caches populated. Do the work in the smallest possible scope, or validate before
+allocating anything. A failure in a static initialiser becomes `ExceptionInInitializerError` and is
+not retried — the class stays unusable for the life of the class loader.
+
+## Cost and diagnostics
+
+Creating an exception captures a stack trace, which is the expensive part. For a condition that is
+expected and frequent, prefer a return value. If you genuinely need a cheap marker, override
+`fillInStackTrace()` — but then you lose the trace, so use that sparingly.
+
+```java
+@Override public synchronized Throwable fillInStackTrace() { return this; }
+```
+
+<KeyPoints>
+- Checked exceptions are part of the contract; unchecked exceptions signal programming errors.
+- `try-with-resources` closes in reverse order and attaches close failures as suppressed exceptions.
+- Always pass the original cause; never reconstruct an exception from a message string alone.
+- Catch the narrowest exception you can handle and rethrow the rest.
+- Do not use exceptions for ordinary control flow; stack capture is expensive.
+- Log once at the boundary, not at every rethrow.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="What is the difference between checked and unchecked exceptions?" level="junior">
+Checked exceptions extend `Exception` but not `RuntimeException` and must be declared or caught;
+they represent recoverable conditions such as I/O failure. Unchecked exceptions extend
+`RuntimeException` and represent programming errors; the compiler does not force handling.
+`Error` is reserved for JVM-level failures and should not be caught.
+</Interview>
+
+<Interview question="How does try-with-resources handle two exceptions?" level="mid">
+The body exception is thrown and the exception from `close()` is added to it via
+`addSuppressed`. Only if the body completes normally does a close failure propagate on its own.
+Resources close in reverse declaration order, and null resources are skipped.
+</Interview>
+
+<Interview question="Why is catching Exception considered a smell?" level="senior">
+It catches unchecked exceptions too, so bugs become silent control flow, and it often swallows
+failures that should abort the operation. It also makes the method's real failure modes invisible
+to callers. Catch specific types at the layer that can act on them, and reserve broad catches for
+process boundaries such as a request handler or a worker loop.
+</Interview>
+
+<Interview question="When would you still use a checked exception in a modern codebase?" level="senior">
+When the caller genuinely has a recovery path that differs from the happy path and the API is
+low-level enough that forcing the decision is useful — for example a parser that must be usable in
+a retry loop. For application services, unchecked domain exceptions mapped to HTTP responses by a
+central handler are usually cleaner.
+</Interview>
+
+<Interview question="What happens if an exception is thrown from a static initializer?" level="mid">
+The JVM wraps it in `ExceptionInInitializerError` for the first attempt; subsequent attempts throw
+`NoClassDefFoundError`. The class is effectively unusable in that class loader, which is why
+configuration loading should be explicit and lazy rather than hidden in static blocks.
+</Interview>
+</InterviewSet>

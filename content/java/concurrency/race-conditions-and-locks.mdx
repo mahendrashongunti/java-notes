@@ -1,0 +1,200 @@
+---
+title: "Race Conditions, Visibility and Locks"
+description: "Why count++ loses updates, what happens-before actually promises, and how to choose between volatile, atomics and locks."
+order: 1
+difficulty: advanced
+tags: ["concurrency", "JMM", "synchronized", "volatile", "atomics"]
+updated: "2026-10-26"
+sources:
+  - title: "JLS §17 — Threads and Locks (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html"
+    note: "Happens-before and the definition of a data race."
+  - title: "java.util.concurrent package (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html"
+  - title: "java.lang.invoke.VarHandle (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/invoke/VarHandle.html"
+    note: "Access modes from plain to volatile."
+---
+
+<Lead>
+Concurrency bugs are rarely about threads running at the same instant. They are about interleavings
+the compiler and CPU are allowed to produce, and about values one thread cannot see that another
+thread wrote.
+</Lead>
+
+## The lost update
+
+`count++` is three operations: read, add, write.
+
+```java
+class Counter {
+    private int count;
+    void increment() { count++; }
+    int get() { return count; }
+}
+```
+
+<Diagram title="Two threads, one lost increment" caption="Both threads read 0 before either writes, so the final value is 1, not 2.">
+{`Thread A                count                Thread B
+────────                ─────                ────────
+read  ───────────────────► 0
+                        │
+                        │                    read ─────► 0
+add 0+1 = 1             │
+                        │                    add 0+1 = 1
+write 1 ◄───────────────┘
+                        │                    write 1 ◄── (overwrites A's 1)
+
+final count = 1   — one increment vanished`}
+</Diagram>
+
+This is a race condition: the result depends on timing. It is also a *check-then-act* bug whenever
+the check and the act are separate operations (`if (map.get(k) == null) map.put(k, v)`).
+
+## Visibility is a separate problem
+
+Even a single write may never be observed by another thread without synchronisation. The JIT can
+hoist a field read out of a loop, and the CPU can reorder independent writes. `synchronized` and
+`volatile` are the language's tools for constraining that.
+
+```java
+class Worker {
+    private boolean running = true;          // no guarantee another thread sees the change
+
+    void stop() { running = false; }
+    void loop() { while (running) { /* spin */ } }   // may never terminate
+}
+```
+
+Making the flag `volatile` fixes the visibility, because a volatile write happens-before a
+subsequent volatile read of the same field.
+
+## happens-before, in one paragraph
+
+The JMM defines a partial order. If action A happens-before action B, then A's writes are visible to
+B and A executes before B. The sources:
+
+- program order within a thread;
+- monitor unlock → subsequent lock of the same monitor;
+- volatile write → subsequent volatile read of the same field;
+- thread start → everything in the started thread;
+- everything in a thread → `join()` returning;
+- the default and final-field rules for object construction.
+
+Without one of those edges, there is no visibility guarantee, no matter how the code looks.
+
+<Callout type="warning" title="volatile is not atomic">
+`volatile int count; count++;` is still a lost update. Volatile guarantees visibility and ordering
+of that single read or write, not the composite operation. Use `AtomicInteger`, `LongAdder`, or a
+lock.
+</Callout>
+
+## The three tools
+
+**synchronized** — mutual exclusion plus visibility. Reentrant, released on exception.
+
+```java
+synchronized int increment() { return ++count; }   // instance monitor
+static synchronized int next() { ... }             // Class monitor
+```
+
+**volatile** — visibility and ordering for a single field, no mutual exclusion. Correct for flags
+and for safely publishing an immutable object reference.
+
+**Atomics** — lock-free compare-and-set. `AtomicInteger`, `AtomicReference`, `LongAdder` (better
+under heavy contention because it spreads writes across cells).
+
+```java
+class Counter {
+    private final LongAdder count = new LongAdder();
+    void increment() { count.increment(); }
+    long get() { return count.sum(); }
+}
+```
+
+## Deadlock
+
+Four conditions must hold: mutual exclusion, hold-and-wait, no preemption, circular wait. The
+practical fix is to break the cycle — establish a global lock order.
+
+```java
+// Transfer A -> B and B -> A concurrently can deadlock.
+// Always lock the lower account id first:
+Account first = a.id() < b.id() ? a : b;
+Account second = first == a ? b : a;
+synchronized (first) {
+    synchronized (second) { /* transfer */ }
+}
+```
+
+Other mitigations: `ReentrantLock.tryLock(timeout)` with backoff, single-threaded confinement, or
+lock-free designs using atomics. `ThreadMXBean.findDeadlockedThreads()` finds them after the fact;
+thread dumps show the cycle.
+
+## ReentrantLock versus synchronized
+
+| | `synchronized` | `ReentrantLock` |
+| --- | --- | --- |
+| Release | automatic on block exit | must call `unlock()` in `finally` |
+| Timeout | no | `tryLock(timeout)` |
+| Interruptible | no | `lockInterruptibly()` |
+| Fairness | no | optional |
+| Condition variables | `wait`/`notify` | multiple `Condition`s |
+| Read/write split | no | `ReentrantReadWriteLock`, `StampedLock` |
+
+Prefer `synchronized` for simple mutual exclusion; reach for `ReentrantLock` when you need timeouts,
+interruptibility, or multiple conditions.
+
+<Callout type="java" title="Never call alien methods while holding a lock">
+Calling a callback, listener, or overridable method while holding a lock invites deadlock and
+unbounded hold times. Copy the state you need, release, then notify.
+</Callout>
+
+## Immutability sidesteps most of this
+
+If an object is immutable and safely published, any number of threads can read it without
+synchronisation. Prefer immutable values, `final` fields, and message passing over shared mutable
+state.
+
+<KeyPoints>
+- `count++` is read-modify-write; without atomicity it loses updates.
+- Visibility needs a happens-before edge: monitor, volatile, thread start/join, or final fields.
+- `volatile` gives visibility, not atomicity.
+- `synchronized` gives both, at the cost of mutual exclusion and possible deadlock.
+- Break deadlock with a global lock order or timed `tryLock`.
+- Immutable, safely published objects need no locking for reads.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="What is a data race versus a race condition?" level="senior">
+A data race is two threads accessing the same non-final field without synchronisation where at
+least one writes. It is undefined behaviour under the JMM. A race condition is broader: correct
+synchronisation may still produce timing-dependent wrong results, such as check-then-act logic
+across two locked operations.
+</Interview>
+
+<Interview question="Does volatile make an increment thread-safe?" level="junior">
+No. `volatile` makes reads and writes of the field visible and ordered, but `x++` is three
+operations. Two threads can still read the same value. Use `AtomicInteger`, `LongAdder` or a lock.
+</Interview>
+
+<Interview question="Explain happens-before with a practical example." level="mid">
+Writing a `volatile boolean ready = true` after filling a data structure, then having another
+thread read `ready` as true, guarantees the structure's writes are visible too: the volatile write
+happens-before the volatile read. Without the volatile field, the reader could see `ready` but stale
+data — or never see the update at all.
+</Interview>
+
+<Interview question="How do you find a deadlock in production?" level="senior">
+Take a thread dump (`jstack`, `jcmd Thread.print`) and look for threads in `BLOCKED` with a cycle of
+monitor ownership. `ThreadMXBean.findDeadlockedThreads()` reports the ids programmatically.
+Prevention is a documented lock order, lock timeouts, and avoiding nested locks or alien calls
+while holding one.
+</Interview>
+
+<Interview question="When is `LongAdder` better than `AtomicLong`?" level="senior">
+Under high write contention. `AtomicLong` funnels all CAS attempts at one cell, so threads retry.
+`LongAdder` spreads updates across cells and sums on read, which scales writes but makes `sum()`
+slightly more expensive and not a consistent snapshot during concurrent updates.
+</Interview>
+</InterviewSet>

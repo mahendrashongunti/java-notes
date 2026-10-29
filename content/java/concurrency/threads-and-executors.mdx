@@ -1,0 +1,184 @@
+---
+title: "Threads, Executors and Virtual Threads"
+description: "Pool sizing, queue choices, CompletableFuture failure modes, and when virtual threads change the answer."
+order: 3
+difficulty: advanced
+tags: ["executors", "virtual-threads", "CompletableFuture", "thread-pools"]
+updated: "2026-10-26"
+sources:
+  - title: "java.util.concurrent.Executors (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/Executors.html"
+  - title: "JEP 444 — Virtual Threads"
+    href: "https://openjdk.org/jeps/444"
+  - title: "java.util.concurrent.StructuredTaskScope (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/StructuredTaskScope.html"
+    note: "Preview API in JDK 21; the shape of structured concurrency."
+---
+
+<Lead>
+Creating a thread per task was always the wrong abstraction, and virtual threads made that obvious.
+What matters now is knowing which pool you are on, what happens when it saturates, and how failures
+propagate.
+</Lead>
+
+## Platform threads versus virtual threads
+
+A platform thread is an OS thread with a large stack. A virtual thread is a JVM-managed task that
+mounts on a small pool of carrier threads and unmounts when it blocks on I/O.
+
+```java
+Thread.ofVirtual().start(() -> System.out.println("cheap"));
+```
+
+The point is not raw speed — it is that blocking code scales. A million virtual threads waiting on
+sockets is fine; a million platform threads is not. Virtual threads are not faster per task, and
+they do not make CPU-bound work parallel beyond your core count.
+
+<Callout type="warning" title="Pinning and pools">
+A virtual thread pinned to its carrier (for example inside a `synchronized` block that blocks, or
+in a native call) cannot unmount. Keep lock scopes short and prefer `ReentrantLock` in code that
+blocks. Also avoid pooling virtual threads: create one per task.
+</Callout>
+
+## Executors: the four shapes
+
+```java
+ExecutorService fixed = Executors.newFixedThreadPool(8);              // bounded threads, unbounded queue
+ExecutorService cached = Executors.newCachedThreadPool();             // unbounded threads, 60s idle
+ExecutorService scheduled = Executors.newScheduledThreadPool(2);      // delayed/periodic
+ExecutorService virtual = Executors.newVirtualThreadPerTaskExecutor();// one virtual thread per task
+```
+
+| Pool | Queue | Failure mode under load |
+| --- | --- | --- |
+| fixed | unbounded `LinkedBlockingQueue` | memory grows, latency explodes, no rejection |
+| cached | synchronous handoff | thread explosion, context-switch storm |
+| scheduled | delay queue | late tasks pile up |
+| virtual-per-task | none | downstream resource exhaustion (connections, DB) |
+
+The unbounded queue behind `newFixedThreadPool` is the most common production mistake. Build pools
+explicitly when the workload is user-facing:
+
+```java
+ThreadPoolExecutor executor = new ThreadPoolExecutor(
+        16, 16,                                   // core == max avoids surprise growth
+        0L, TimeUnit.MILLISECONDS,
+        new ArrayBlockingQueue<>(500),            // bounded
+        new ThreadPoolExecutor.CallerRunsPolicy() // backpressure instead of dropping
+);
+```
+
+`CallerRunsPolicy` slows the producer, which is usually the behaviour you want. `AbortPolicy` throws
+`RejectedExecutionException` and is right when the caller can retry or fail fast.
+
+## Sizing
+
+For CPU-bound work: roughly `cores` threads (or `cores + 1`). For blocking I/O with platform
+threads: `cores × (1 + waitTime / serviceTime)` from Little's Law. With virtual threads, size the
+*downstream resource* instead — a 20-connection pool still limits you to 20 concurrent queries.
+
+## Submitting work and handling failure
+
+```java
+Future<Order> future = executor.submit(() -> repository.load(id));
+
+try {
+    Order order = future.get(2, TimeUnit.SECONDS);
+} catch (TimeoutException e) {
+    future.cancel(true);                   // interrupt, best effort
+} catch (ExecutionException e) {
+    Throwable cause = e.getCause();        // the real failure is wrapped
+}
+```
+
+`submit` swallows exceptions into the `Future`; if nobody calls `get`, failures vanish. That is why
+fire-and-forget tasks need their own error handling.
+
+`CompletableFuture` composes instead of blocking:
+
+```java
+CompletableFuture<Receipt> flow = loadOrder(id)
+        .thenCompose(order -> charge(order))
+        .thenApply(receipt -> receipt.withStatus("PAID"))
+        .exceptionally(error -> Receipt.failed(error.getMessage()));
+
+flow.orTimeout(3, TimeUnit.SECONDS);
+```
+
+Pitfalls worth knowing:
+
+- `thenApply` wraps the value; `thenCompose` flattens a returned future — mixing them up yields
+  `CompletableFuture<CompletableFuture<T>>`.
+- The default executor is the common `ForkJoinPool`, shared with parallel streams. Supply your own.
+- `exceptionally` only handles failures upstream; `handle` runs on both paths.
+- `join()` throws `CompletionException`; `get()` throws `ExecutionException`.
+
+## Shutdown
+
+```java
+executor.shutdown();                              // stop accepting, finish queued work
+if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+    executor.shutdownNow();                       // interrupt running tasks, drain queue
+}
+```
+
+Spring and other frameworks do this for you, but only if you let them manage the bean. A static
+executor created inside a class is a leak in tests and on redeploy.
+
+## Structured concurrency
+
+Instead of leaking tasks into a shared pool, structured concurrency ties subtask lifetimes to a
+block: if one fails, the others are cancelled, and the block cannot exit until they finish.
+
+```java
+try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    Supplier<User> user = scope.fork(() -> users.load(id));
+    Supplier<List<Order>> orders = scope.fork(() -> orders.byUser(id));
+
+    scope.join().throwIfFailed();
+    return new Profile(user.get(), orders.get());
+}
+```
+
+That is the shape most request handlers actually want: fan out, fail fast, no orphaned work.
+
+<KeyPoints>
+- Virtual threads make blocking I/O cheap; they do not speed up CPU-bound work or add parallelism.
+- A fixed pool has an unbounded queue unless you build it explicitly; bound it and choose a rejection policy.
+- Size pools by the bottleneck — cores for CPU, downstream connections for I/O.
+- `submit` hides exceptions inside the `Future`; handle them or they disappear.
+- `thenCompose` flattens futures; `thenApply` wraps values.
+- Shut executors down; a leaking pool breaks redeploys and tests.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="What problem do virtual threads solve?" level="mid">
+They remove the thread-per-request cost for I/O-bound workloads. Blocking calls unmount the virtual
+thread from its carrier instead of occupying an OS thread, so tens of thousands of concurrent
+requests fit in memory. Throughput still depends on the downstream resource.
+</Interview>
+
+<Interview question="Why is an unbounded queue dangerous in a thread pool?" level="senior">
+Tasks accumulate faster than they drain, so memory grows and latency becomes unbounded while the
+pool reports itself as healthy. A bounded queue plus an explicit rejection policy turns overload
+into a visible, controllable failure — backpressure, a fast 503, or caller-runs.
+</Interview>
+
+<Interview question="Difference between thenApply and thenCompose?" level="junior">
+`thenApply` maps the result value and returns `CompletableFuture<R>`. `thenCompose` maps to another
+future and flattens it, avoiding nested futures. Use `thenCompose` for anything that itself returns
+a `CompletableFuture`, like another async call.
+</Interview>
+
+<Interview question="How do you size a pool for blocking I/O?" level="senior">
+Estimate threads as cores × (1 + wait/service). Measure both times rather than guessing. With
+virtual threads, do not size the pool at all — size the limiting resource (DB connections, HTTP
+client connections) and let the tasks queue at that boundary.
+</Interview>
+
+<Interview question="What is structured concurrency and why prefer it to raw submit?" level="senior">
+It scopes subtasks to a block: the parent waits for all children, failures cancel siblings, and no
+task outlives the request. Raw `submit` returns a `Future` with no lifetime relationship to the
+caller, so cancellation, error propagation and observability have to be built by hand.
+</Interview>
+</InterviewSet>

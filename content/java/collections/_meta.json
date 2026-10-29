@@ -1,0 +1,5 @@
+{
+  "title": "Collections",
+  "description": "How the standard collections are built, where they break down, and how to reason about their complexity instead of memorising it.",
+  "order": 2
+}

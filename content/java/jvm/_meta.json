@@ -1,0 +1,5 @@
+{
+  "title": "JVM Internals",
+  "description": "Class loading, bytecode, JIT compilation, garbage collection and the diagnostics you reach for when production misbehaves.",
+  "order": 4
+}

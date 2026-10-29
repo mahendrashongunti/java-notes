@@ -1,0 +1,166 @@
+---
+title: "HashMap Internals"
+description: "Hashing, resizing, treeified buckets and the failure modes that come from mutable keys."
+order: 1
+difficulty: advanced
+tags: ["HashMap", "hashing", "collections"]
+updated: "2026-10-24"
+sources:
+  - title: "java.util.HashMap (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/HashMap.html"
+    note: "Documented complexity and the treeification thresholds."
+  - title: "java.util.Map (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/Map.html"
+    note: "Null handling and default methods such as computeIfAbsent."
+  - title: "Dev.java — Collections and Streams"
+    href: "https://dev.java/learn/api/collections-and-streams/"
+---
+
+<Lead>
+`HashMap` is an array of buckets with a hash spread, a load factor and a tree fallback. Once you can
+picture the array, every behaviour — iteration order, resize cost, that weird `16` default — has an
+explanation.
+</Lead>
+
+## The shape
+
+```text
+table (power-of-two length, default 16)
+
+index 0  →  null
+index 1  →  Node("b", 2) → Node("z", 26)        collision chain
+index 2  →  TreeNode(...)                        treeified bucket (8+ entries)
+...
+index 15 →  Node("a", 1)
+```
+
+Each entry is a `Node` holding `hash`, `key`, `value` and `next`. The index is
+`(n - 1) & hash`, which is why the capacity must be a power of two — it turns the modulo into a
+mask. `HashMap` also spreads the hash (`h ^ (h >>> 16)`) so high bits influence the low bits used
+for the index.
+
+## The put path
+
+1. Compute the spread hash of the key. `null` is special-cased to bucket 0.
+2. If the table is empty, allocate the default capacity (16).
+3. Find the bucket. Walk the chain comparing hash first, then `equals`.
+4. If the key exists, replace the value and return the old one.
+5. Otherwise append a node; if the chain reaches 8 entries and the table is at least 64, convert
+   the bucket to a red-black tree (O(log n) worst case).
+6. Increment `size`; if it exceeds `capacity * 0.75`, resize.
+
+## Resizing
+
+Default load factor `0.75` balances space against collisions. When the threshold is crossed, the
+table doubles and every entry is redistributed.
+
+Because capacity is a power of two, an entry either stays at its index or moves by exactly the old
+capacity — determined by one bit of the hash. Java 8+ exploits this to split each bucket into a
+"lo" and "hi" list instead of recomputing every hash.
+
+```java
+Map<String, Integer> map = new HashMap<>(1_000_000);
+```
+
+The constructor takes *capacity*, not expected size: with a load factor of 0.75 you need
+`expected / 0.75 + 1` buckets, or use `Maps.newHashMapWithExpectedSize` from Guava. Pre-sizing
+avoids repeated rehashing of a large map, which is the most common real performance fix.
+
+## What the treeification threshold really means
+
+- Buckets treeify at 8 entries **and** capacity ≥ 64; below that, the table resizes instead.
+- Treeified buckets untreeify at 6 entries.
+- Tree nodes keep `next` pointers so iteration order is preserved during conversion.
+
+Treeification is a defence against hash-flooding attacks and pathological `hashCode`
+implementations, not a general performance feature. If your keys hash well, buckets rarely exceed
+two or three entries.
+
+<Callout type="danger" title="Mutable keys and broken lookups">
+The bucket index is computed at insertion from `hashCode()`. Mutate a field used by `hashCode` or
+`equals`, and the entry stays where it is while lookups go elsewhere. Use immutable keys —
+`String`, `Integer`, records with immutable components.
+</Callout>
+
+## Iteration order is not a contract
+
+`HashMap` makes no ordering promise. It is not insertion order and not sorted; it happens to look
+stable for the same keys and capacity because the hash is deterministic, but a resize changes it.
+If you need order, use `LinkedHashMap` (insertion or access order) or `TreeMap` (sorted).
+
+```java
+Map<String, Integer> lru = new LinkedHashMap<>(16, 0.75f, true) {
+    @Override protected boolean removeEldestEntry(Map.Entry<String, Integer> eldest) {
+        return size() > 100;
+    }
+};
+```
+
+That anonymous subclass is the standard library's built-in LRU.
+
+## Nulls and the methods that surprise
+
+`HashMap` allows one null key and any number of null values; `ConcurrentHashMap` allows neither.
+`Map.of` and `Map.copyOf` also reject nulls.
+
+```java
+map.get(key);                          // null could mean "absent" or "mapped to null"
+map.getOrDefault(key, 0);              // still cannot distinguish a stored null
+map.computeIfAbsent(key, k -> new ArrayList<>());   // atomic in ConcurrentHashMap
+```
+
+`computeIfAbsent` is convenient but the mapping function must not modify the same map — that is a
+`ConcurrentModificationException` in `HashMap` and can deadlock in some concurrent maps.
+
+## Which map to reach for
+
+| Need | Use | Note |
+| --- | --- | --- |
+| General purpose, single thread | `HashMap` | fastest, allows nulls |
+| Insertion or access order | `LinkedHashMap` | predictable iteration, LRU base |
+| Sorted keys, range queries | `TreeMap` | O(log n), `Comparable`/`Comparator` |
+| Concurrent updates | `ConcurrentHashMap` | no nulls, weakly consistent iteration |
+| Tiny fixed map | `Map.of` | immutable, rejects nulls |
+| Enum keys | `EnumMap` | array-backed, very fast |
+
+<KeyPoints>
+- Bucket index is `(capacity - 1) & spread(hash)`; capacity is a power of two.
+- Default load factor 0.75; resize doubles capacity and splits buckets using one hash bit.
+- Buckets treeify at 8 entries when capacity ≥ 64, untreeify at 6.
+- Iteration order is undefined; use `LinkedHashMap` or `TreeMap` when order matters.
+- Mutable keys break lookups because the bucket was chosen at insertion time.
+- Pre-size large maps to avoid repeated rehashing.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="Walk me through what happens on `map.put(key, value)`." level="senior">
+Compute the spread hash, allocate the table if needed, index into the bucket, then walk the chain
+comparing hash and `equals`. Replace on a match; otherwise append, treeify if the bucket is long
+enough and capacity is at least 64, then increment size and resize if the load factor is exceeded.
+</Interview>
+
+<Interview question="Why is the default capacity 16 and load factor 0.75?" level="mid">
+Sixteen is small enough to avoid waste for typical maps and a power of two so indexing is a mask.
+0.75 is the empirical balance between memory and collision probability: lower means more space and
+fewer collisions, higher means denser tables and longer chains.
+</Interview>
+
+<Interview question="How does Java 8 avoid rehashing every entry on resize?" level="senior">
+Capacity doubles, so an entry's new index differs from the old one only by one bit — the bit at the
+old capacity. The implementation splits each bucket into a low list and a high list and appends them
+to the two new slots, preserving relative order and avoiding per-entry hash recomputation.
+</Interview>
+
+<Interview question="HashMap vs Hashtable vs ConcurrentHashMap?" level="junior">
+`Hashtable` synchronises every method on the whole table and is legacy. `HashMap` is unsynchronised
+and allows nulls. `ConcurrentHashMap` uses lock striping/CAS for concurrent reads and writes,
+disallows nulls, and has weakly consistent iterators that do not throw
+`ConcurrentModificationException`.
+</Interview>
+
+<Interview question="What happens if two keys have the same hashCode but are not equal?" level="mid">
+They share a bucket and are stored in the same chain (or tree). Lookup compares hashes first, then
+`equals`, so both remain retrievable. This is a collision, not a bug; a poor `hashCode` that sends
+everything to one bucket degrades the map to O(n) or O(log n) with treeification.
+</Interview>
+</InterviewSet>

@@ -1,0 +1,188 @@
+---
+title: "Sealed Types and Pattern Matching"
+description: "Closed hierarchies, exhaustive switches, record patterns and guards — the modern replacement for visitor boilerplate."
+order: 8
+difficulty: advanced
+tags: ["sealed", "pattern-matching", "records", "switch"]
+updated: "2026-10-24"
+sources:
+  - title: "JLS §8 — Classes (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html"
+    note: "Sealed classes and permitted subclasses."
+  - title: "JLS §14 — Blocks, Statements, and Patterns (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-14.html"
+    note: "Pattern matching and exhaustiveness for switch."
+  - title: "Dev.java — Language Constructs"
+    href: "https://dev.java/learn/language/constructs/"
+---
+
+<Lead>
+Sealed types let a hierarchy say "these are all the implementations, forever". Pattern matching then
+turns that closed set into compile-time exhaustiveness — add a variant, and every switch that
+forgot it stops compiling.
+</Lead>
+
+## Closing a hierarchy
+
+```java
+public sealed interface Payment permits CardPayment, BankTransfer, WalletPayment {}
+
+public record CardPayment(String last4, BigDecimal amount) implements Payment {}
+public record BankTransfer(String iban, BigDecimal amount) implements Payment {}
+public record WalletPayment(String walletId, BigDecimal amount) implements Payment {}
+```
+
+Rules:
+
+- Every permitted subtype must be in the same module (or the same package for the unnamed module).
+- Each subtype must be `final`, `sealed`, or explicitly `non-sealed`.
+- The `permits` clause can be omitted when all subtypes are declared in the same file, in which
+  case the compiler infers them.
+
+`non-sealed` reopens a branch for extension, which is useful at library boundaries where one
+variant is meant to be implemented by users. Be deliberate: it gives up exhaustiveness below that
+node.
+
+## Exhaustive switch
+
+```java
+static BigDecimal fee(Payment payment) {
+    return switch (payment) {
+        case CardPayment card -> card.amount().multiply(new BigDecimal("0.029"));
+        case BankTransfer transfer -> BigDecimal.ZERO;
+        case WalletPayment wallet -> wallet.amount().multiply(new BigDecimal("0.01"));
+    };
+}
+```
+
+No `default` is required, and adding a fourth `Payment` type breaks compilation here — exactly the
+safety a visitor only gives you if you remember to implement the new method.
+
+<Callout type="warning" title="`default` defeats the purpose">
+Adding `default` to silence the compiler removes the exhaustiveness check. If you must handle
+unknown implementations — a plugin system, for example — make the hierarchy `non-sealed` at that
+point and handle the fallback deliberately.
+</Callout>
+
+## Record patterns and destructuring
+
+```java
+record Point(int x, int y) {}
+record Line(Point start, Point end) {}
+
+static String describe(Object shape) {
+    return switch (shape) {
+        case Line(Point(var x1, var y1), Point(var x2, var y2)) when x1 == x2 ->
+                "vertical at x=" + x1;
+        case Line(Point(var x1, var y1), Point(var x2, var y2)) when y1 == y2 ->
+                "horizontal at y=" + y1;
+        case Line(Point start, Point end) -> "from " + start + " to " + end;
+        case Point(var x, var y) -> "point " + x + "," + y;
+        default -> "unknown";
+    };
+}
+```
+
+Record patterns nest: the compiler calls accessors in order, so component order must match the
+record declaration. A `var` pattern binds the whole component; `var x` extracts it.
+
+## Guards
+
+`when` adds a boolean condition to a case. Guards are evaluated in order after the type pattern
+matches, so a guarded case does not prove exhaustiveness on its own.
+
+```java
+static String classify(int value) {
+    return switch (value) {
+        case 0 -> "zero";
+        case int n when n < 0 -> "negative";
+        default -> "positive";
+    };
+}
+```
+
+## Type patterns in `instanceof`
+
+```java
+if (obj instanceof Order order && order.total().signum() > 0) {
+    process(order);   // order is in scope, already cast
+}
+```
+
+The binding is flow-scoped: it is definitely assigned only where the compiler can prove the test
+succeeded, and it cannot be reassigned.
+
+## Null in switch
+
+A `switch` over a sealed type still throws `NullPointerException` on a null selector unless you add
+an explicit `case null`.
+
+```java
+static String label(Payment payment) {
+    return switch (payment) {
+        case null -> "none";
+        case CardPayment card -> "card " + card.last4();
+        case BankTransfer transfer -> "transfer";
+        case WalletPayment wallet -> "wallet";
+    };
+}
+```
+
+Adding `case null` makes the switch total over null too. `case null, default -> ...` is also legal
+when a fallback is genuinely wanted.
+
+## Sealed types versus the visitor pattern
+
+| | Sealed + switch | Visitor |
+| --- | --- | --- |
+| Adding a variant | every switch fails to compile | every visitor must be updated by hand |
+| Adding an operation | one new function | one new visitor class |
+| State | local variables | visitor fields |
+| Extensibility outside the module | impossible without reopening | possible |
+
+Sealed hierarchies favour adding operations, which matches most application code. Visitor still
+wins when the type set is stable and third parties must add operations, or when a traversal needs
+significant per-node state.
+
+<KeyPoints>
+- `sealed` plus `permits` defines a closed set; subtypes must be `final`, `sealed` or `non-sealed`.
+- Exhaustive switch expressions over sealed types need no `default` and fail compilation when a variant is added.
+- Record patterns destructure by component order and can nest.
+- Guards (`when`) add conditions but do not contribute to exhaustiveness.
+- Switch throws on null unless `case null` is declared.
+- Choose visitor when operations are the extension axis; choose sealed types when variants are.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="What does sealed actually guarantee?" level="mid">
+That the set of direct subtypes is known and fixed at compile time, and each subtype is either final,
+sealed or non-sealed. It enables exhaustive analysis by the compiler and prevents third-party
+implementations outside the permitted list. It does not make instances immutable or methods
+thread-safe.
+</Interview>
+
+<Interview question="Why does an exhaustive switch over a sealed interface not need a default?" level="senior">
+The compiler knows the complete set of permitted subtypes and can prove every value is covered. That
+proof is also why adding a new permitted subtype breaks the build until every switch handles it,
+which is the feature rather than a nuisance.
+</Interview>
+
+<Interview question="What is the difference between a guard and a type pattern?" level="mid">
+A type pattern tests and binds the runtime type (`case CardPayment card`). A guard is an additional
+boolean expression (`when card.amount().signum() > 0`) evaluated after the pattern matches. Guards
+can make a case inapplicable at runtime, so they cannot be relied on for exhaustiveness.
+</Interview>
+
+<Interview question="Can a sealed interface be implemented in another module?" level="junior">
+No. Permitted subtypes must be in the same module, or the same package when the code is on the
+classpath without modules. The compiler enforces this, which is what makes the closed-world
+assumption sound.
+</Interview>
+
+<Interview question="When would you still use the visitor pattern with sealed types?" level="senior">
+When the operations live in a separate, independently versioned module and the type hierarchy is
+stable, or when traversal needs accumulated state across nodes. With sealed types the compiler
+already covers the "new variant" axis, so visitor is mainly about distributing operations, not
+about safety.
+</Interview>
+</InterviewSet>

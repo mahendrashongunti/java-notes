@@ -1,0 +1,147 @@
+---
+title: "Garbage Collection in Practice"
+description: "Generations, the collectors you will actually meet, and how to read a GC log without panicking."
+order: 2
+difficulty: advanced
+tags: ["GC", "G1", "ZGC", "memory"]
+updated: "2026-10-23"
+sources:
+  - title: "HotSpot Virtual Machine Garbage Collection Tuning Guide (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/gc-tuning/"
+    note: "Collector selection, logging and heap sizing."
+  - title: "JEP 439 — Generational ZGC"
+    href: "https://openjdk.org/jeps/439"
+  - title: "jcmd (JDK 21 tool reference)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/specs/man/jcmd.html"
+  - title: "Dev.java — Security and Garbage Collection"
+    href: "https://dev.java/learn/jvm/security-gc/"
+---
+
+<Lead>
+You rarely tune a collector from first principles. You read a log, identify whether you have a
+latency problem or a memory problem, and change one thing.
+</Lead>
+
+## Reachability, not reference counting
+
+The JVM finds live objects by tracing from GC roots: thread stacks, static fields, JNI references and
+synchronisation monitors. Anything unreachable is collectable, which is why reference cycles are not
+a leak in Java.
+
+`finalize()` is deprecated for removal — it delays collection and can resurrect objects. Use
+`try-with-resources` or `Cleaner` for deterministic cleanup.
+
+## Generational hypothesis
+
+Most objects die young. Heap is split into a young generation (Eden plus two survivor spaces) and an
+old generation.
+
+```text
+┌──────────── young ────────────┬──────── old ────────┐
+│ Eden │ S0 │ S1               │ tenured objects     │
+└───────────────────────────────┴─────────────────────┘
+```
+
+Minor GC copies live objects between survivor spaces and promotes long-lived ones. Major/old
+collections are more expensive, which is why allocation rate is the metric that matters: the more
+garbage you create per second, the more often young collections run.
+
+## The collectors
+
+| Collector | Shape | Best for |
+| --- | --- | --- |
+| Serial | single-threaded, stop-the-world | small heaps, containers, CLI tools |
+| Parallel | multi-threaded STW | throughput batches, no latency SLO |
+| G1 | region-based, incremental | default since Java 9; balanced |
+| ZGC | concurrent, coloured pointers | very large heaps, pause < 1 ms |
+| Shenandoah | concurrent compaction | low pause, OpenJDK builds |
+
+G1 divides the heap into equal regions (Eden, survivor, old, humongous for large objects), collects
+the regions with the most garbage first (hence the name), and targets a pause time with
+`-XX:MaxGCPauseMillis`. ZGC does most work concurrently, including compaction, and its pauses are
+roughly independent of heap size.
+
+<Callout type="note" title="Defaults are good">
+Since Java 9, G1 is the default and is fine for most services. Switching to ZGC is justified by a
+measured pause problem on a large heap, not by fashion. Always measure before and after.
+</Callout>
+
+## The one log line to understand
+
+```text
+[2.341s][info][gc] GC(42) Pause Young (Normal) (G1 Evacuation Pause) 812M->143M(2048M) 18.442ms
+```
+
+- `812M->143M` — heap used before and after; the difference is what was collected.
+- `(2048M)` — committed heap.
+- `18.442ms` — pause duration, the number that affects tail latency.
+
+Enable logs with:
+
+```text
+-Xlog:gc*:file=gc.log:time,uptime,level,tags
+```
+
+If the post-GC heap keeps climbing and never returns to a stable floor, you have a leak — take a heap
+dump and find the dominator.
+
+## OutOfMemoryError is not one thing
+
+| Message | Meaning | First move |
+| --- | --- | --- |
+| `Java heap space` | live set too large or leak | heap dump, `jcmd GC.heap_dump` |
+| `Metaspace` | class loader leak | check redeploys, generated classes |
+| `GC overhead limit exceeded` | spending nearly all time collecting | reduce allocation or raise heap |
+| `unable to create native thread` | thread count or memory limit | reduce threads, check ulimits |
+| `Direct buffer memory` | off-heap NIO buffers | cap `-XX:MaxDirectMemorySize` |
+
+## Tuning that actually helps
+
+1. **Fix allocation first.** Fewer short-lived objects beats any flag.
+2. **Size the heap for the live set**, not the maximum the machine allows. Leave headroom for
+   metaspace, stacks and off-heap buffers.
+3. **Use `-Xms = -Xmx`** in containers to avoid resizing pauses.
+4. **Enable GC logs and heap dumps on OOM** (`-XX:+HeapDumpOnOutOfMemoryError`).
+5. **Respect the container limit** — `-XX:MaxRAMPercentage=75` rather than a hard-coded `-Xmx`.
+
+```text
+-XX:MaxRAMPercentage=75 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps
+-Xlog:gc*:stdout:time,uptime,level,tags
+```
+
+<KeyPoints>
+- GC traces from roots; cycles are collectable, unreachable objects are not leaks.
+- Young collections dominate when allocation rate is high; reduce allocation first.
+- G1 is the default and targets pause time; ZGC trades throughput for sub-millisecond pauses.
+- Post-GC heap that keeps rising indicates a live-set leak, not a tuning problem.
+- `OutOfMemoryError` messages identify the region: heap, metaspace, threads or direct buffers.
+- Always capture GC logs and a heap dump on OOM before changing flags.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="How would you diagnose a memory leak in a Java service?" level="senior">
+Watch post-GC heap over time; if the floor rises, capture a heap dump and compare dominator trees
+across two dumps. Look for growing collections, caches without bounds, `ThreadLocal` retention,
+class loader leaks, and listeners that are registered but never removed. Fix the retention path
+rather than raising the heap.
+</Interview>
+
+<Interview question="What is the difference between G1 and ZGC?" level="mid">
+G1 is region-based and incremental but still has stop-the-world evacuation pauses that grow with
+live data. ZGC performs marking, relocation and remapping concurrently using coloured pointers and
+load barriers, keeping pauses under a millisecond even on very large heaps, at some throughput and
+memory cost.
+</Interview>
+
+<Interview question="What triggers a full GC?" level="mid">
+Old-generation exhaustion, metaspace pressure, explicit `System.gc()` (usually ignored unless
+enabled), or a collector-specific policy such as G1's concurrent-start threshold. Frequent full GCs
+mean the live set no longer fits the heap or the promotion rate is too high.
+</Interview>
+
+<Interview question="Why is `finalize()` discouraged?" level="junior">
+There is no bound on when it runs, it can resurrect the object, it slows allocation, and it runs on
+a single finaliser thread that can become a bottleneck. Use try-with-resources for deterministic
+cleanup and `Cleaner` for a last-resort safety net.
+</Interview>
+</InterviewSet>

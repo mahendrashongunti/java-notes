@@ -1,0 +1,397 @@
+---
+title: "The Java Memory Model"
+description: "What happens-before actually guarantees, why a non-volatile flag can spin forever, and how final fields make safe publication work."
+order: 2
+difficulty: advanced
+tags: ["JMM", "happens-before", "volatile", "safe-publication", "atomics"]
+updated: "2026-10-29"
+status: draft
+sources:
+  - title: "JLS §17 — Threads and Locks (Java SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html"
+    note: "The normative memory model: happens-before, data races and final field semantics."
+  - title: "java.util.concurrent package summary (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html"
+    note: "The memory consistency guarantees of the concurrent collections and synchronizers."
+  - title: "java.lang.invoke.VarHandle (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/invoke/VarHandle.html"
+    note: "Access modes from plain to volatile, and their ordering guarantees."
+  - title: "JLS §8 — Classes (Java SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html"
+    note: "Field declarations, including final fields and constructor rules."
+---
+
+<Lead>
+The Java Memory Model is not a description of your CPU. It is a contract about which executions a JVM
+is allowed to produce, and it exists because compilers and processors reorder, cache and speculate.
+Almost every concurrency bug is a violation of an ordering rule you assumed but never established.
+</Lead>
+
+## The model describes allowed outcomes
+
+Without a memory model, “thread A wrote `x = 42` before thread B read `x`” has no meaning: the compiler
+may hoist a read, the CPU may buffer a write, and a core may serve a stale cache line. The JMM defines a
+partial order called **happens-before** (HB). If one action happens-before another, the first is
+guaranteed visible to the second. If two conflicting accesses are not ordered, the program contains a
+**data race**, and the result is whatever the implementation happens to do.
+
+This is why the model is written in terms of *permitted* behaviours rather than timings. Two threads
+executing at different wall-clock instants can still have no ordering guarantee between them.
+
+## Data races and happens-before
+
+A data race exists when two threads access the same non-final field, at least one access is a write, and
+the accesses are not ordered by happens-before. The JMM then permits outcomes that no sequential
+execution could produce.
+
+The edges that create ordering:
+
+1. **Program order** — actions within one thread are ordered as written.
+2. **Monitor lock** — an unlock happens-before every later lock of the same monitor.
+3. **Volatile** — a write to a volatile field happens-before every later read of that field.
+4. **Thread start** — `Thread.start()` happens-before any action in the started thread.
+5. **Thread termination** — every action in a thread happens-before another thread returns from `join()`.
+6. **Default initialisation** — zeroing of fields happens-before any other action.
+7. **Transitivity** — if A happens-before B and B happens-before C, then A happens-before C.
+
+```text
+Thread A                          Thread B
+────────                          ────────
+x = 42
+volatile ready = true  ── HB ──►  if (ready) read x   → 42
+
+unlock(m)              ── HB ──►  lock(m)
+start()                ── HB ──►  first action of the started thread
+last action of thread  ── HB ──►  return from join()
+```
+
+Note what is missing: `Thread.sleep`, `System.nanoTime`, logging and “it ran later” create no edges.
+Time is not a synchronisation mechanism.
+
+## The flag that never clears
+
+```java
+class Worker extends Thread {
+    private boolean stop;                  // no visibility guarantee
+
+    @Override public void run() {
+        while (!stop) {
+            // spin
+        }
+    }
+
+    void shutdown() {
+        stop = true;
+    }
+}
+```
+
+A JIT compiler is allowed to read `stop` once and hoist it out of the loop, because nothing in the loop
+writes the field. The reading thread may then never observe `true`. The fix is not a longer sleep; it is
+an ordering edge:
+
+```java
+private volatile boolean stop;
+```
+
+Two practical warnings:
+
+- Adding `System.out.println` inside the loop often makes the bug disappear, because `PrintStream`
+  synchronises internally. The program is still incorrect.
+- `Thread.sleep(1)` is not a substitute for synchronisation. It changes timing, not visibility.
+
+## `volatile`: visibility and ordering, not atomicity
+
+A volatile write publishes everything written before it; a volatile read acquires everything published
+before the write it observes. That makes `volatile` the right tool for a flag, a status field, or a
+reference to an immutable object.
+
+```java
+class Publication {
+    private int value;
+    private volatile boolean ready;
+
+    void write() {
+        value = 42;          // ordinary write
+        ready = true;        // volatile write: publishes `value` too
+    }
+
+    int read() {
+        return ready ? value : -1;   // volatile read: acquires `value`
+    }
+}
+```
+
+But volatile gives no atomicity for compound actions:
+
+```java
+private volatile int count;
+
+void increment() {
+    count++;          // read, add, write — three steps, still a data race
+}
+```
+
+Two threads can both read `0`. Use `AtomicInteger`, `LongAdder`, or put the invariant behind a lock.
+This is the single most common `volatile` mistake: it fixes visibility and leaves the race.
+
+## Locks: mutual exclusion plus an ordering edge
+
+` synchronized` does two jobs. It provides mutual exclusion for the block, and the monitorenter/monitorexit
+pair adds a happens-before edge, so writes inside the block are visible to the next thread that acquires
+the same monitor.
+
+```java
+class Counter {
+    private int count;
+
+    synchronized void increment() {
+        count++;
+    }
+
+    synchronized int get() {
+        return count;
+    }
+}
+```
+
+Monitors are reentrant, so a synchronized method can call another one on the same object. Two different
+objects are two different locks — a common bug when a class is instantiated twice and the invariant spans
+both. `ReentrantLock` adds timed and interruptible acquisition, fairness as an option, and multiple
+conditions. Biased locking, once an optimisation for uncontended monitors, was removed in JDK 15
+(JEP 374); uncontended locking is still cheap, but it is not free.
+
+## `final` fields and safe publication
+
+`final` fields have semantics beyond immutability. If an object does not escape its constructor, any
+thread that sees the reference is guaranteed to see correctly initialised final fields, without any
+synchronisation. This is what makes immutable value objects safely publishable.
+
+```java
+final class Snapshot {
+    private final int[] values;
+
+    Snapshot(int[] source) {
+        this.values = source.clone();   // defensive copy, never mutated afterwards
+    }
+
+    int sum() {
+        int total = 0;
+        for (int value : values) total += value;
+        return total;
+    }
+}
+```
+
+The guarantee freezes at the end of the constructor and breaks if `this` escapes during construction:
+
+```java
+class Leaky {
+    private final int x;
+
+    Leaky(EventBus bus) {
+        bus.register(this::onEvent);   // `this` escapes before x is assigned
+        x = 42;
+    }
+
+    private void onEvent(Event event) { /* may observe x == 0 */ }
+}
+```
+
+Registering a listener, starting a thread, or storing `this` in a static field inside a constructor all
+publish a partially constructed object. Non-final fields have no freeze at all; they need an explicit
+edge.
+
+## Double-checked locking, done correctly
+
+The classic broken idiom reads a non-volatile field outside the lock, so a thread can see a non-null
+reference to an object whose fields are not yet visible. The modern version uses one volatile read on the
+hot path:
+
+```java
+final class Config {
+    private static volatile Config instance;
+
+    static Config get() {
+        Config local = instance;              // volatile read, no locking in the common case
+        if (local == null) {
+            synchronized (Config.class) {
+                local = instance;
+                if (local == null) {
+                    local = new Config();
+                    instance = local;         // volatile write publishes the constructed object
+                }
+            }
+        }
+        return local;
+    }
+
+    private Config() {}
+}
+```
+
+The local variable is not cosmetic: it avoids a second volatile read and makes the null checks operate on
+one observed value. Despite being correct, this pattern is usually unnecessary — a static holder class or
+an enum gives you lazy, thread-safe initialisation with no code to review.
+
+## Atomics and CAS
+
+Atomics replace locks when the state is a single variable and the update can be expressed as a
+compare-and-set loop.
+
+```java
+class Hits {
+    private final AtomicLong count = new AtomicLong();
+
+    void record() {
+        count.incrementAndGet();       // internally a CAS retry loop
+    }
+
+    long total() {
+        return count.get();
+    }
+}
+```
+
+```java
+static int increment(AtomicInteger value) {
+    int current;
+    int next;
+    do {
+        current = value.get();
+        next = current + 1;
+    } while (!value.compareAndSet(current, next));   // retry if another thread won
+    return next;
+}
+```
+
+Under heavy contention, CAS retries waste work. `LongAdder` spreads updates across cells and sums them on
+read; it scales better for counters, but `sum()` is not an atomic snapshot and the value can be stale
+while updates are in flight. Use `AtomicLong` when you need a single coherent value, `LongAdder` when you
+need throughput on a hot counter.
+
+CAS also has the ABA problem: a value can change from A to B and back to A between the read and the
+compare, making the swap succeed when the state has moved on. `AtomicStampedReference` adds a version
+stamp when that matters.
+
+## VarHandle access modes
+
+`VarHandle` exposes the ordering levels underneath `volatile` and atomics. Choosing the weakest correct
+mode is a real optimisation in concurrent data structures.
+
+| Mode | Ordering | Typical use |
+| --- | --- | --- |
+| plain | none | single-threaded teardown, already-published data |
+| opaque | coherence, no reordering guarantee | progress flags where exact ordering is irrelevant |
+| acquire / release | one-way ordering; release publishes prior writes | hand-off between threads |
+| volatile | full happens-before in both directions | flags and references read by other threads |
+
+```java
+private static final VarHandle READY =
+        MethodHandles.lookup().findVarHandle(Flag.class, "ready", boolean.class);
+
+void publish() {
+    value = 42;
+    READY.setRelease(this, true);      // prior writes become visible on acquire
+}
+
+int read() {
+    return (boolean) READY.getAcquire(this) ? value : -1;
+}
+```
+
+The static initialiser must handle `NoSuchFieldException` and `IllegalAccessException`; in practice these
+handles live in a static block or a holder class. For application code, `volatile` and `Atomic*` express
+the same intent with far less ceremony.
+
+## What the model does not promise
+
+- **Sequential consistency for racy code.** Only correctly synchronised programs are guaranteed to behave
+  as if operations executed in a single global order. A racy program may produce values that never existed.
+- **Atomicity of `long` and `double`.** Reads and writes of non-volatile 64-bit values may tear on some
+  platforms; `volatile` and atomics fix that.
+- **That x86 is representative.** x86 has a comparatively strong memory model (stores are not reordered
+  with stores), so release/acquire bugs often appear only on ARM. Code that “works on my laptop” is not
+  evidence.
+- **That a lock-free algorithm is faster.** Contention turns CAS loops into retry storms; measure.
+
+False sharing is the hardware-side counterpart: two independent volatile counters in the same object can
+land on one cache line, so updating one invalidates the other core's copy. `LongAdder` exists partly to
+avoid this. Padding fields or `@Contended` (an internal annotation that requires additional JVM flags) can
+help in extreme cases, but the first fix is usually to stop sharing the variable.
+
+## A review checklist
+
+1. Which fields are written by one thread and read by another? Each needs an edge or must be immutable.
+2. Is any compound action (`++`, check-then-act, lazy init) protected by a lock or an atomic?
+3. Does any `this` escape during construction — listener registration, thread start, static assignment?
+4. Are published objects immutable, or copied defensively on the way in and out?
+5. Does any code rely on `sleep`, logging or scheduling for correctness?
+6. Is a concurrent collection used for a compound invariant it cannot protect? `ConcurrentHashMap` makes
+   each operation atomic, not a sequence of them.
+
+<KeyPoints>
+- Happens-before is the only visibility guarantee; elapsed time creates none.
+- Conflicting accesses without an HB edge are a data race, and the JMM permits surprising results.
+- `volatile` publishes prior writes and orders reads, but `count++` remains a race.
+- Locks give mutual exclusion *and* an HB edge; atomics give atomicity for one variable.
+- Final fields are safely visible if `this` never escapes the constructor.
+- DCL needs a volatile field; static holders and enums are simpler and equally lazy.
+- Weaker `VarHandle` modes are for library code; application code should prefer `volatile` and atomics.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="Explain happens-before and name the edges you rely on." level="senior">
+Happens-before is a partial order over actions. If A happens-before B, A's writes are visible to B and
+A is ordered before B. The edges I rely on most: program order within a thread, unlock to subsequent
+lock of the same monitor, volatile write to subsequent volatile read, `Thread.start` to the started
+thread's first action, and a thread's actions to another thread's return from `join`. Transitivity
+composes them. Anything not connected by these edges may be reordered or cached.
+</Interview>
+
+<Interview question="Is `volatile int count; count++` thread-safe?" level="junior">
+No. `volatile` guarantees visibility and ordering, not atomicity. `count++` is a read, an add and a
+write, so two threads can interleave and lose an update. Use `AtomicInteger.incrementAndGet()` or
+`LongAdder`, or guard the increment with a lock.
+</Interview>
+
+<Interview question="Why did double-checked locking need `volatile`, and what changed in Java 5?" level="senior">
+Without `volatile`, another thread could observe the reference before the constructor's writes were
+visible, so it would use a partially constructed object. Before Java 5 the JMM did not give final fields
+a freeze guarantee either, so even a correct-looking implementation could fail. Java 5 clarified final
+field semantics and volatile ordering, making the volatile version correct. The remaining cost is a
+volatile read on every call, which is why holder classes are often preferable.
+</Interview>
+
+<Interview question="What exactly do final fields guarantee?" level="mid">
+If an object is published without escaping its constructor, any thread that sees the reference sees the
+correctly initialised final fields, with no synchronisation. The freeze happens at the end of the
+constructor. It does not make referenced objects immutable — a final array reference can still point at
+mutable contents — and it does not protect non-final fields. Escaping `this` during construction voids
+the guarantee for the escaping reference.
+</Interview>
+
+<Interview question="When would you choose `synchronized` over `ReentrantLock` or an atomic?" level="mid">
+`synchronized` when the critical section is short, the lock is private, and I do not need timed or
+interruptible acquisition; it is simpler and cannot be forgotten. `ReentrantLock` when I need
+`tryLock` with a timeout, interruptible waits, fairness or multiple conditions. Atomics when the state
+is a single variable and the update is a CAS-friendly expression. Atomics do not compose: protecting an
+invariant across two fields still needs a lock.
+</Interview>
+
+<Interview question="Why can adding a log statement make a race disappear?" level="senior">
+`System.out` is a `PrintStream` whose methods synchronise internally, which introduces ordering and
+changes timing, so stale reads and lost updates may stop reproducing. The underlying data race is
+unchanged; the observation mechanism masked it. That is why concurrency bugs must be reasoned about
+from happens-before edges, and ideally reproduced with a stress harness such as jcstress rather than by
+adding print statements.
+</Interview>
+
+<Interview question="Is the JMM sequentially consistent?" level="senior">
+Only for correctly synchronised programs: if all sequentially consistent executions are free of data
+races, the program's behaviour is sequentially consistent. Racy programs may exhibit behaviours with no
+sequential explanation, including seeing writes out of order or values that were never written together.
+The practical rule is to establish an edge for every shared mutable field, not to assume the hardware
+will be polite.
+</Interview>
+</InterviewSet>

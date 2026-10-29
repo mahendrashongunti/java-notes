@@ -1,0 +1,306 @@
+---
+title: "Streams and Functional Pipelines"
+description: "How a stream pipeline is assembled, why nothing runs until the terminal operation, and where collectors and parallel streams actually cost you."
+order: 7
+difficulty: advanced
+tags: ["streams", "functional", "collectors", "parallel"]
+updated: "2026-10-29"
+status: draft
+sources:
+  - title: "java.util.stream package summary (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/package-summary.html"
+    note: "The normative description of laziness, statelessness, side effects and reduction."
+  - title: "java.util.stream.Collectors (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/Collectors.html"
+    note: "Downstream collectors, grouping, teeing and the duplicate-key rules for toMap."
+  - title: "Dev.java — Collections and Streams"
+    href: "https://dev.java/learn/api/collections-and-streams/"
+    note: "Worked examples of stream pipelines and collectors."
+  - title: "JLS §15 — Expressions (Java SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html"
+    note: "Lambda expressions, method references and target typing."
+---
+
+<Lead>
+A stream pipeline is built in one place and executed in another. The gap between those two moments
+explains laziness, short-circuiting, why a debugger steps over the whole chain, and why
+`parallel()` sometimes makes a fast query slower.
+</Lead>
+
+## A stream is a description, not a collection
+
+A collection holds elements. A stream holds *operations over* elements: it does not store them, cannot
+be indexed, and is consumed once. The elements come from a source — a collection, an array, a file, a
+generator — and the pipeline is a prescription for what to do with them.
+
+```java
+Stream<String> names = List.of("ada", "grace", "alan").stream();
+
+names.forEach(System.out::println);   // terminal operation: runs the pipeline
+names.count();                        // IllegalStateException: stream has already been operated upon or closed
+```
+
+That single-use rule is not an inconvenience to work around; it is what allows a stream to represent a
+non-repeatable source such as a socket or an infinite generator.
+
+## A pipeline has three parts
+
+```text
+orders.stream()                       source          lazy
+      .filter(o -> !o.refunded())     intermediate    lazy
+      .map(Order::region)             intermediate    lazy
+      .distinct()                     intermediate    stateful
+      .collect(toList())              terminal        runs everything
+
+nothing executes here ────────────────┬─────────────── everything executes here
+```
+
+- **Source** — creates the stream. For a collection this is `stream()`, `parallelStream()` or
+  `Stream.of(...)`.
+- **Intermediate operations** — return a new stream. They only record what should happen.
+- **Terminal operations** — return a value, an `Optional`, an array or `void`, and trigger traversal.
+
+The mental model that matters is *vertical* execution: each element passes through the whole chain
+before the next element is pulled. A pipeline is not a sequence of passes over the data, so a `map`
+before a `filter` costs a full mapping of every element, not only the survivors.
+
+```java
+record Order(String id, String region, int cents, boolean refunded) {}
+
+List<Order> orders = List.of(
+        new Order("A-1", "eu", 1200, false),
+        new Order("A-2", "us", 800, true),
+        new Order("A-3", "eu", 4500, false),
+        new Order("A-4", "us", 9900, false));
+
+Map<String, Integer> netByRegion = orders.stream()
+        .filter(order -> !order.refunded())
+        .collect(Collectors.groupingBy(
+                Order::region,
+                TreeMap::new,                        // deterministic order for this example
+                Collectors.summingInt(Order::cents)));
+
+System.out.println(netByRegion);
+```
+
+<ShellOutput>
+{`{eu=5700, us=9900}`}
+</ShellOutput>
+
+`groupingBy` takes an optional map supplier and an optional downstream collector. Without the
+`TreeMap::new` supplier the result is a `HashMap`, and its iteration order is not a contract.
+
+## Laziness is observable
+
+Because intermediate stages are lazy, a terminal operation that can stop early stops the whole
+pipeline early.
+
+```java
+Optional<String> first = Stream.of("alpha", "beta", "gamma")
+        .peek(word -> System.out.println("visiting " + word))
+        .filter(word -> word.length() == 4)
+        .findFirst();
+```
+
+<ShellOutput>
+{`visiting alpha
+visiting beta
+Optional[beta]`}
+</ShellOutput>
+
+`gamma` is never visited. `findFirst` is short-circuiting, so the pipeline asks for elements only until
+it has an answer. The same is true of `findAny`, `anyMatch`, `allMatch`, `noneMatch`, `limit` and
+`takeWhile`. This is also why a stream over an infinite source is safe as long as a short-circuiting
+operation bounds it.
+
+## Stateless and stateful stages
+
+| Stage | Kind | What it must remember |
+| --- | --- | --- |
+| `filter`, `map`, `flatMap`, `peek` | stateless | nothing |
+| `distinct` | stateful | every element seen so far |
+| `sorted` | stateful, barrier | all elements before emitting the first |
+| `limit`, `skip` | stateful, short-circuiting | a counter |
+| `takeWhile`, `dropWhile` | short-circuiting | whether the boundary was crossed |
+
+Stateful stages break the element-at-a-time model. `sorted()` must drain the source before it can emit
+anything, so it destroys short-circuiting and makes infinite sources unusable:
+
+```java
+Stream.iterate(1, n -> n * 2)
+        .limit(6)
+        .toList();          // [1, 2, 4, 8, 16, 32]
+```
+
+Put `limit` before `sorted`, never after, when the source is unbounded. In parallel pipelines a
+stateful stage is also a synchronization barrier, which is why `sorted().parallel()` rarely pays off.
+
+## Collectors do most of the real work
+
+`collect` is the general terminal operation; `Collectors` supplies the recipes. Two of them look
+interchangeable and are not:
+
+```java
+List<Order> mutable = orders.stream().collect(Collectors.toList());  // mutable, implementation unspecified
+List<Order> fixed = orders.stream().toList();                        // unmodifiable, allows nulls
+```
+
+`Stream.toList()` (Java 16+) is the shorter and safer default. If you need to add to the result, copy
+it explicitly: `new ArrayList<>(orders.stream().toList())`.
+
+A few collectors worth knowing by shape:
+
+```java
+// Count by region, only for settled orders.
+Map<String, Long> settledByRegion = orders.stream()
+        .filter(order -> !order.refunded())
+        .collect(Collectors.groupingBy(Order::region, Collectors.counting()));
+
+// Two aggregates in one pass.
+record Report(long count, int total) {}
+Report report = orders.stream().collect(Collectors.teeing(
+        Collectors.counting(),
+        Collectors.summingInt(Order::cents),
+        Report::new));
+```
+
+`toMap` is the one that fails loudly in production:
+
+```java
+Map<String, Order> byId = orders.stream()
+        .collect(Collectors.toMap(Order::id, order -> order));
+// duplicate ids -> IllegalStateException: Duplicate key A-1 (attempted merging values ...)
+```
+
+Supply a merge function when duplicates are possible, or use `groupingBy` when you actually want a
+collection per key. `groupingBy` also rejects a `null` key with a `NullPointerException`, even though
+`HashMap` itself accepts one.
+
+## `reduce` needs an associative function
+
+`reduce` combines elements with a binary operator. For a sequential pipeline almost anything works; for
+a parallel one the operator must be associative and the identity must be a true identity.
+
+```java
+int total = IntStream.rangeClosed(1, 100).parallel().reduce(0, Integer::sum);   // 5050
+```
+
+Subtraction is not associative, so `(a - b) - c` is not `a - (b - c)`. Splitting the same range into
+chunks and recombining with subtraction produces a different, split-dependent answer. If a parallel
+result depends on the order of combination, the reduction is wrong even when a test passes.
+
+For anything more complex than a fold, use a collector — collectors are explicitly specified for
+parallel use, including their combiner.
+
+## Parallel streams share one pool
+
+`parallelStream()` and `stream().parallel()` run on the common `ForkJoinPool`, whose parallelism is
+`Runtime.getRuntime().availableProcessors() - 1`. On a four-core container that is three threads shared
+by every parallel stream in the JVM.
+
+That design is fine for CPU-bound, splittable, stateless work over a large in-memory collection. It is
+a poor fit for:
+
+- **Blocking I/O.** Parked tasks occupy the pool and starve unrelated requests.
+- **Small inputs.** Splitting and joining cost more than the work.
+- **Non-splittable sources.** `LinkedList`, `Iterator`-backed streams and `BufferedReader.lines()`
+  split badly or not at all.
+- **Stateful stages or side effects.** Ordering and race behaviour become undefined.
+
+Ordered streams also constrain parallel execution. `findFirst` must respect encounter order, so it
+cannot return the first result found; `findAny` can. `forEach` gives no order guarantee even on an
+ordered stream; `forEachOrdered` restores it at a cost.
+
+## Primitive streams and boxing
+
+`Stream<Integer>` boxes every element. `IntStream`, `LongStream` and `DoubleStream` avoid that and add
+numeric terminals:
+
+```java
+IntSummaryStatistics stats = orders.stream().mapToInt(Order::cents).summaryStatistics();
+System.out.println(stats.getSum() + " " + stats.getAverage());
+```
+
+<ShellOutput>
+{`16400 4100.0`}
+</ShellOutput>
+
+Use `mapToInt`/`mapToLong`/`mapToDouble` before numeric aggregation, and `boxed()` only when you truly
+need objects.
+
+## When a loop is the better answer
+
+Streams are a notation for transformations, not a performance feature. Keep a loop when:
+
+- the body throws checked exceptions and wrapping them in a lambda adds noise;
+- you need `break`, `continue`, labelled exits or mutation of several accumulators;
+- the collection is tiny and the pipeline is harder to read than the loop;
+- the operation is I/O and you want explicit resource handling.
+
+A `forEach` that only produces side effects is usually a loop wearing a costume. Prefer returning a
+value with `collect`, `reduce` or `toList`, and keep I/O at the boundary.
+
+## Mistakes that compile
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `IllegalStateException: stream has already been operated upon` | stream reused | build the pipeline per use |
+| nothing happens | no terminal operation | add `toList`, `count`, `forEach` |
+| `UnsupportedOperationException` on `add` | `Stream.toList()` is unmodifiable | copy into a new `ArrayList` |
+| `IllegalStateException: Duplicate key` | `toMap` with colliding keys | merge function or `groupingBy` |
+| different results with `parallel()` | non-associative `reduce` or stateful lambda | associative reduction, stateless lambdas |
+| never terminates / `OutOfMemoryError` | unbounded source without `limit` | bound it or use `takeWhile` |
+
+<KeyPoints>
+- A stream is a single-use description; nothing runs until a terminal operation.
+- Elements flow through the whole chain one at a time, so stage order changes cost, not just style.
+- Stateful stages (`sorted`, `distinct`, `limit`) buffer or count and break short-circuiting.
+- `Stream.toList()` is unmodifiable; `Collectors.toList()` is mutable with an unspecified type.
+- `reduce` must be associative and identity-correct before it can be parallelised.
+- Parallel streams use the shared common pool, so blocking work starves unrelated code.
+- Prefer a loop for checked exceptions, early exits and multi-variable accumulation.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="What is the difference between an intermediate and a terminal operation?" level="junior">
+Intermediate operations return another stream and are lazy; they only record the stage. A terminal
+operation requests elements and drives traversal exactly once. A pipeline with no terminal operation
+does nothing at all, which is the usual explanation for “my stream doesn't run”.
+</Interview>
+
+<Interview question="Why is `peek` unsuitable for business logic?" level="mid">
+`peek` exists for debugging. Because stages are free to be elided or fused, and because a stream may
+not need every element, the action is not guaranteed to run for each element. It also encourages side
+effects inside a pipeline, which break under parallel execution. Use `map` to transform, `collect` to
+accumulate, and keep I/O outside the pipeline.
+</Interview>
+
+<Interview question="map versus flatMap?" level="junior">
+`map` applies a one-to-one function and keeps the result as a single element, so returning a list gives
+you a stream of lists. `flatMap` expects a stream (or anything the mapper turns into one) and splices
+those streams into one flat stream. Use `flatMap` for nested collections, `Optional` results and
+one-to-many expansions.
+</Interview>
+
+<Interview question="When would a parallel stream make code slower?" level="senior">
+When the work per element is small relative to splitting and joining, when the source splits poorly,
+when boxing dominates, when a stateful stage such as `sorted` forces a barrier, or when another part of
+the application is already saturating the shared `ForkJoinPool`. Blocking I/O in a parallel stream is
+especially harmful because it parks the pool's few threads. Measure with JMH before and after; the
+default answer for request-scoped I/O is sequential code plus virtual threads.
+</Interview>
+
+<Interview question="How do you collect into an immutable map, and what happens on duplicate keys?" level="mid">
+Use `Collectors.toUnmodifiableMap`, which throws `NullPointerException` for null keys or values and
+`IllegalStateException` on duplicate keys. `Collectors.toMap` behaves the same way for duplicates
+unless you pass a merge function; it returns a mutable map. Neither silently keeps the last value,
+which is a common assumption and a common production failure.
+</Interview>
+
+<Interview question="What does `Stream.toList()` guarantee that `Collectors.toList()` does not?" level="mid">
+`Stream.toList()` returns an unmodifiable list, permits null elements, and has a defined contract.
+`Collectors.toList()` returns a mutable list but makes no guarantee about its concrete type or
+mutability characteristics, so code that relies on `ArrayList` behaviour is relying on an
+implementation detail. For a mutable result, copy explicitly.
+</Interview>
+</InterviewSet>

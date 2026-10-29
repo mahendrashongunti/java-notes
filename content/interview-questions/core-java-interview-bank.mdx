@@ -1,0 +1,174 @@
+---
+title: "Core Java Interview Bank"
+description: "Fifty questions grouped by topic, with answers short enough to say out loud."
+order: 1
+difficulty: intermediate
+tags: ["interview", "core java", "revision"]
+updated: "2026-10-27"
+sources:
+  - title: "JLS §17 — Threads and Locks (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html"
+    note: "Happens-before and final field semantics behind the concurrency answers."
+  - title: "JVMS §2 — The Structure of the Java Virtual Machine (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html"
+  - title: "java.lang.Object (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Object.html"
+    note: "The equals and hashCode contracts."
+---
+
+<Lead>
+Use this as a checklist, not a script. For each question, the goal is a two-sentence answer plus the
+one detail that shows you have actually debugged it.
+</Lead>
+
+## Language and the object model
+
+<Interview question="What is the difference between an interface and an abstract class?" level="junior">
+An interface declares a contract and supports multiple inheritance of type plus default methods; it
+cannot hold instance state. An abstract class can hold state, constructors and protected members,
+but a class can extend only one. Use an interface for capability, an abstract class for shared
+implementation with invariants.
+</Interview>
+
+<Interview question="Can you override a static method?" level="junior">
+No — static methods are hidden, not overridden. The call is resolved from the static type at compile
+time, so calling through a supertype reference invokes the supertype's version.
+</Interview>
+
+<Interview question="Why is `String` immutable?" level="mid">
+So it can be safely shared: interned literals, map keys with cached hash codes, and security
+decisions cannot be mutated underneath the caller. Immutability also makes strings inherently
+thread-safe.
+</Interview>
+
+<Interview question="What is the difference between `final`, `finally` and `finalize`?" level="junior">
+`final` prevents reassignment, overriding or extension. `finally` is a block that runs after
+try/catch. `finalize()` was a pre-GC hook and is deprecated for removal — use try-with-resources.
+</Interview>
+
+<Interview question="Explain the contract between equals and hashCode." level="mid">
+Equal objects must have equal hash codes, and both must be consistent while the object is unchanged.
+`equals` must be reflexive, symmetric, transitive and null-safe. Violating either breaks hash-based
+collections, usually as silent lookup failures.
+</Interview>
+
+## Generics
+
+<Interview question="Why can't you create a generic array?" level="mid">
+Array creation requires a reified component type for store checks; `T` is erased. Use a `List<T>`, an
+`Object[]` cast with a suppressed warning, or `Array.newInstance` with a runtime class.
+</Interview>
+
+<Interview question="What is type erasure and what does it break?" level="mid">
+Generic type arguments are removed at compile time and replaced by their bounds. You cannot use
+`instanceof List<String>`, create `new T[]`, declare static fields of type `T`, or overload methods
+that differ only by type argument. Bridge methods preserve overriding.
+</Interview>
+
+<Interview question="Explain PECS." level="senior">
+Producer extends, consumer super. Read from `List<? extends T>` as `T`; write `T` into
+`List<? super T>`. It follows from invariance: a subtype container can be read safely but not
+written, a supertype container can be written but only read as `Object`.
+</Interview>
+
+## Collections
+
+<Interview question="HashMap vs Hashtable vs ConcurrentHashMap?" level="junior">
+`Hashtable` locks the whole table and is legacy. `HashMap` is unsynchronised and allows nulls.
+`ConcurrentHashMap` uses finer-grained concurrency, disallows null keys and values, and has weakly
+consistent iterators.
+</Interview>
+
+<Interview question="How does HashMap handle collisions?" level="mid">
+Colliding entries share a bucket as a linked list; from Java 8 a bucket with at least 8 entries (and
+capacity ≥ 64) becomes a red-black tree, giving O(log n) worst case instead of O(n).
+</Interview>
+
+<Interview question="Why is `ArrayList` usually preferred over `LinkedList`?" level="mid">
+Contiguous storage makes iteration and random access fast and cache-friendly. `LinkedList` allocates
+a node per element and its `get(i)`/`remove(i)` are O(n) because they must walk to the node. Use
+`ArrayDeque` when you need queue semantics.
+</Interview>
+
+<Interview question="What causes ConcurrentModificationException?" level="junior">
+Structurally modifying a collection while iterating it with a fail-fast iterator. Use
+`iterator.remove()`, `removeIf`, or a concurrent collection. It is a bug detector, not a
+synchronisation guarantee.
+</Interview>
+
+## Concurrency
+
+<Interview question="Difference between `volatile` and `synchronized`?" level="mid">
+`volatile` guarantees visibility and ordering for one field but not atomicity. `synchronized`
+provides mutual exclusion plus visibility, is reentrant, and can protect multi-step invariants.
+`count++` needs the latter (or an atomic).
+</Interview>
+
+<Interview question="What is a happens-before relationship?" level="senior">
+A partial order guaranteeing that writes before the edge are visible after it: program order,
+monitor unlock/lock, volatile write/read, thread start/join, and final field construction. Without
+an edge, there is no visibility guarantee, even if the write "obviously" happened first.
+</Interview>
+
+<Interview question="How do you prevent deadlock?" level="senior">
+Break circular wait: acquire locks in a global order, use `tryLock` with timeouts, avoid nested
+locks and alien calls under a lock, or eliminate shared mutable state. Detect with thread dumps or
+`ThreadMXBean.findDeadlockedThreads()`.
+</Interview>
+
+<Interview question="What are virtual threads good for?" level="mid">
+I/O-bound concurrency: blocking calls unmount instead of occupying an OS thread, so request-per-thread
+style scales to many thousands of tasks. They do not increase CPU parallelism, and pinning (blocking
+inside `synchronized` or native calls) reduces their benefit.
+</Interview>
+
+<Interview question="Why is an unbounded queue in a fixed thread pool dangerous?" level="senior">
+It hides overload: tasks queue without bound, memory grows and latency climbs while the pool looks
+healthy. Use a bounded queue with an explicit rejection policy so saturation becomes visible and
+backpressure is applied.
+</Interview>
+
+## JVM
+
+<Interview question="What is the difference between `==` and `equals` for Strings?" level="junior">
+`==` compares references; `equals` compares characters. Literals are interned so `==` can appear to
+work, then fail for strings built at runtime or read from I/O. Always use `equals`.
+</Interview>
+
+<Interview question="How does the JIT decide what to optimise?" level="senior">
+It profiles call sites and branches, then compiles hot methods with C1 and later C2. Monomorphic
+call sites are inlined and devirtualised; if the profile becomes polymorphic, the code is
+deoptimised and recompiled. Benchmarks must warm up.
+</Interview>
+
+<Interview question="When would you choose ZGC over G1?" level="senior">
+When measured pause times on a large heap violate the latency budget. ZGC keeps pauses under a
+millisecond by doing marking and relocation concurrently, at some throughput and memory overhead.
+For ordinary services, G1's defaults are usually fine.
+</Interview>
+
+<Interview question="Explain class loading delegation." level="mid">
+Loaders ask the parent first, so JDK classes cannot be shadowed by application classes. A class is
+identified by name plus defining loader, so the same class loaded twice is two distinct types and
+cannot be cast across loaders.
+</Interview>
+
+## Design
+
+<Interview question="When is inheritance the wrong choice?" level="mid">
+When the relationship is really composition, when the supertype's contract cannot be honoured by the
+subtype (LSP violation), or when the class is not designed for extension. Prefer final classes,
+sealed hierarchies, and delegation.
+</Interview>
+
+<Interview question="What makes an object immutable?" level="mid">
+Final fields, no reachable mutable state, defensive copies of mutable inputs and outputs, no `this`
+escape during construction, and no subclassing (or a private constructor with factories). Immutable
+objects are automatically thread-safe when safely published.
+</Interview>
+
+<Interview question="How do you design a good exception hierarchy?" level="senior">
+One base runtime exception per bounded context, specific subtypes carrying structured data (codes,
+ids), causes always preserved, no leaking of internal types across module boundaries, and a single
+boundary that maps them to responses while logging once with context.
+</Interview>

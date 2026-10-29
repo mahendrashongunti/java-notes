@@ -1,0 +1,138 @@
+---
+title: "Effective Java — Reading Notes"
+description: "The items that changed how I write Java, grouped by the decision they influence."
+order: 1
+difficulty: intermediate
+tags: ["books", "effective java", "design"]
+updated: "2026-10-17"
+sources:
+  - title: "Effective Java, 3rd Edition — publisher page"
+    href: "https://www.informit.com/store/effective-java-3rd-edition-9780134685991"
+    note: "The edition these notes are keyed to."
+  - title: "JLS §8 — Classes (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html"
+    note: "The normative rules behind Items on equality, composition and inheritance."
+---
+
+<Lead>
+*Effective Java* is a list of decisions, not a tutorial. These are the items I still apply weekly,
+with the reasoning compressed.
+</Lead>
+
+## Creating and destroying objects
+
+**Static factories over constructors.** They have names (`List.of`, `Optional.empty`), can cache
+instances, can return subtypes, and can defer allocation. The cost is that they are not discoverable
+as constructors — document them.
+
+**Builder when there are many parameters.** Telescoping constructors are unreadable and error-prone
+past three arguments. A builder with validation in `build()` keeps the object immutable and the call
+site legible.
+
+**Prefer dependency injection to singletons.** A singleton hides its dependencies in a static access
+point and makes tests share state. Pass the collaborator in; let a container manage lifetime.
+
+**Avoid finalisers and cleaners.** No timing guarantee, performance cost, possible resurrection. Use
+try-with-resources.
+
+## Methods common to all objects
+
+**Obey the equals contract.** Reflexive, symmetric, transitive, consistent, null-safe, and consistent
+with `hashCode`. Prefer composition or final classes to avoid the symmetry trap.
+
+**Always override `toString`.** Logs and debuggers are the primary consumers; an unreadable default
+costs hours over a project's life.
+
+**Be careful with `clone`.** It is brittle and bypasses constructors. Prefer copy constructors or
+static copy factories.
+
+**Consider `Comparable`.** Natural ordering makes sorting, `TreeMap` and `TreeSet` work. Keep
+`compareTo` consistent with `equals` or document the exception.
+
+## Classes and interfaces
+
+**Minimise accessibility.** A public class is an API commitment. Package-private by default; make
+things public when a caller needs them.
+
+**Favour composition over inheritance.** Inheritance couples you to the superclass's implementation
+and breaks encapsulation. Wrapping is more code and fewer surprises.
+
+**Design and document for inheritance, or forbid it.** Either provide hooks and document them, or
+make the class `final`. The middle ground is where bugs live.
+
+**Prefer interfaces to abstract classes.** Interfaces allow multiple inheritance of type and
+retrofitting; abstract classes are for shared state and skeletal implementations
+(`AbstractList` plus `List`).
+
+**Use interfaces only to define types.** Constant interfaces are an anti-pattern; use enums or
+static imports.
+
+## Generics
+
+**Do not use raw types.** They disable checking for the whole expression. `List<?>` when the type is
+genuinely unknown.
+
+**Prefer lists to arrays.** Arrays are covariant and reified, generics are invariant and erased;
+mixing them produces unchecked warnings that cannot be eliminated safely.
+
+**Favour generic methods.** They infer types at the call site and avoid casts.
+
+**Use bounded wildcards.** PECS — producers extend, consumers super — makes APIs more flexible
+without losing safety.
+
+**Combine generics and varargs carefully.** `@SafeVarargs` only when the array is never written.
+
+## Enums and annotations
+
+**Use enums instead of int constants.** Type safety, `values()`, methods, and `EnumMap`/`EnumSet`
+support.
+
+**Use `EnumMap` instead of ordinal indexing.** Ordinals change when constants are reordered and are
+meaningless outside the enum.
+
+**Use marker interfaces to define types.** `Serializable` is a marker interface; annotations cannot
+define a type, so use them for metadata only.
+
+## Lambdas and streams
+
+**Prefer lambdas to anonymous classes.** Less noise, same semantics for functional interfaces, and
+`this` behaves more intuitively.
+
+**Prefer method references to lambdas** when they are clearer — but not when the reference obscures
+which overload is called.
+
+**Use streams judiciously.** Streams express transformations well; they obscure control flow with
+complex branching, checked exceptions, or mutation of external state.
+
+**Keep side effects out of streams.** Especially in parallel streams, where the encounter order and
+threading make mutation a data race.
+
+**Prefer `Collection` to `Stream` as a return type.** A collection can be iterated twice and has a
+size; return a stream only when laziness is the point.
+
+## Methods and general programming
+
+**Check parameters at the boundary.** Fail fast with `Objects.requireNonNull` and explicit range
+checks. Document exceptions with `@throws`.
+
+**Return empty collections, not null.** Callers should not have to null-check a list.
+
+**Use `Optional` for absent return values, not for fields or parameters.** It communicates intent at
+the API boundary; boxing it into fields adds noise.
+
+**Minimise the scope of local variables.** Declare where used; this prevents stale values and
+use-after-close bugs.
+
+**Prefer primitive types to boxed.** Boxing allocates and `==` on boxed values outside the cache is
+a bug.
+
+**Beware of performance tuning without measurement.** Write clean code, then profile. The JIT
+rewards simple, monomorphic code.
+
+<KeyPoints>
+- Most items reduce to one idea: make invalid states unrepresentable and contracts explicit.
+- Composition and immutability prevent more bugs than any design pattern.
+- Generics and wildcards are about API flexibility with compile-time safety.
+- Streams are a tool for transformations, not a replacement for all loops.
+- The book is worth re-reading by section as the codebase changes shape.
+</KeyPoints>

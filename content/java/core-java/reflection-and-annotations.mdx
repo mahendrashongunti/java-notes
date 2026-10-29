@@ -1,0 +1,196 @@
+---
+title: "Reflection, Annotations and Proxies"
+description: "How frameworks inspect and wire your classes, what reflection costs, and how runtime annotations actually reach you."
+order: 9
+difficulty: advanced
+tags: ["reflection", "annotations", "proxies", "frameworks"]
+updated: "2026-10-25"
+sources:
+  - title: "java.lang.reflect package (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/reflect/package-summary.html"
+  - title: "Dev.java — Reflection and Method Handles"
+    href: "https://dev.java/learn/api/reflection-method-handles/"
+  - title: "JVMS §5 — Loading, Linking, and Initializing (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-5.html"
+    note: "Access checks and reflective invocation."
+---
+
+<Lead>
+Spring, Jackson and Hibernate all do the same trick: read metadata off your classes at runtime and
+call members that your code never calls directly. Understanding reflection is understanding what
+those frameworks can and cannot see.
+</Lead>
+
+## The Class object
+
+Every loaded type has exactly one `Class` instance per class loader, reachable three ways:
+
+```java
+Class<?> a = String.class;                 // class literal
+Class<?> b = "text".getClass();            // instance
+Class<?> c = Class.forName("java.lang.String");  // by name, can throw ClassNotFoundException
+```
+
+`Class` is the entry point for metadata:
+
+```java
+record Order(String id, BigDecimal total) {}
+
+Class<Order> type = Order.class;
+type.getRecordComponents();                 // record metadata, in declaration order
+type.getDeclaredConstructor(String.class, BigDecimal.class);
+type.getDeclaredFields();                   // fields declared here
+type.getFields();                           // public fields, including inherited
+type.getDeclaredMethods();                  // declared here, includes synthetic bridge methods
+type.getMethods();                          // public, including inherited
+```
+
+`getDeclared*` returns everything declared on the class regardless of visibility but not inherited
+members; `get*` returns public members including inherited ones. Confusing the two is the usual
+cause of "my private field is missing" and "I see methods I never wrote".
+
+## Accessing members
+
+```java
+var field = Order.class.getDeclaredField("total");
+field.setAccessible(true);                   // may fail under modules or a security manager
+Object value = field.get(order);
+```
+
+`setAccessible(true)` bypasses Java access checks but not module encapsulation: a non-exported
+package in a named module throws `InaccessibleObjectException` unless the module opens it
+(`--add-opens`). This is why newer JDKs break reflection-heavy libraries.
+
+## Annotations that survive compilation
+
+Retention decides whether the annotation is visible at runtime:
+
+| `@Retention` | Visible to | Typical use |
+| --- | --- | --- |
+| `SOURCE` | compiler only | `@Override`, `@SuppressWarnings`, lint |
+| `CLASS` | class file, not runtime | bytecode tools, default |
+| `RUNTIME` | reflection | Spring, Jackson, validation |
+
+```java
+@Retention(RetentionPolicy.RUNTIME)
+@Target({ElementType.TYPE, ElementType.METHOD})
+@Inherited
+public @interface Audited {
+    String value() default "default";
+}
+```
+
+`@Inherited` applies only to class-level annotations and only through superclass extension, not
+through interfaces. Repeatable annotations are wrapped in a container annotation that reflection
+must unwrap with `getAnnotationsByType`.
+
+<Callout type="warning" title="Annotations carry no behaviour">
+An annotation is metadata. Something must read it — a compiler plugin, an annotation processor, a
+framework at startup. Adding `@Transactional` to a method does nothing unless the proxy machinery
+is active, which is also why self-invocation bypasses it.
+</Callout>
+
+## Dynamic proxies
+
+`java.lang.reflect.Proxy` creates an implementation of one or more interfaces at runtime. Every
+call is routed to an `InvocationHandler`.
+
+```java
+interface Repository { String find(String id); }
+
+Repository repository = (Repository) Proxy.newProxyInstance(
+    Repository.class.getClassLoader(),
+    new Class<?>[] { Repository.class },
+    (proxy, method, args) -> {
+        long start = System.nanoTime();
+        try {
+            return "value-for-" + args[0];
+        } finally {
+            System.out.printf("%s took %d ns%n", method.getName(), System.nanoTime() - start);
+        }
+    });
+
+repository.find("42");
+```
+
+Constraints: interfaces only, no final classes, and `equals`/`hashCode`/`toString` are also routed
+to the handler — handle them or you get surprising behaviour in collections. Spring's JDK proxies
+work this way; CGLIB/ByteBuddy subclass proxies exist because classes without interfaces need
+proxying too, and those cannot proxy `final` methods.
+
+## What reflection costs
+
+- **Lookup** is comparatively slow: `getDeclaredMethod` scans metadata and may allocate.
+- **Invocation** through `Method.invoke` is slower than a direct call, though JIT can inline hot
+  paths after enough calls.
+- **Access checks** disappear after `setAccessible(true)` in older JDKs; modern JDKs cache them.
+- **Frameworks mitigate** by caching `Method` objects and, increasingly, using `MethodHandle` or
+  `VarHandle` instead.
+
+```java
+MethodHandle handle = MethodHandles.lookup().findVirtual(
+        Order.class, "total", MethodType.methodType(BigDecimal.class));
+BigDecimal total = (BigDecimal) handle.invokeExact(order);
+```
+
+`MethodHandle` is type-checked at link time and can be optimised like a normal call site. Prefer it
+for infrastructure code; prefer direct calls everywhere else.
+
+## Reflection and records
+
+Records expose components as both accessors and record components, which is what makes them ideal
+for serialisation frameworks:
+
+```java
+for (RecordComponent component : type.getRecordComponents()) {
+    Object value = component.getAccessor().invoke(order);
+    System.out.println(component.getName() + "=" + value);
+}
+```
+
+Jackson uses exactly this to serialise records without setters.
+
+<KeyPoints>
+- One `Class` instance per type per class loader; `getDeclared*` excludes inherited members.
+- `setAccessible` bypasses access checks but not module encapsulation.
+- Only `RUNTIME` retention annotations are visible to reflection; `@Inherited` only applies to classes.
+- Annotations are inert metadata — something must interpret them.
+- JDK dynamic proxies require interfaces and route `equals`/`hashCode`/`toString` through the handler.
+- Cache reflective lookups; reach for `MethodHandle` in infrastructure code.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="Why does `getDeclaredMethods()` return methods you never wrote?" level="mid">
+The compiler adds synthetic members: bridge methods for generic overrides, accessors for nested
+class captures, and enum helpers. Filter with `method.isSynthetic()` or `isBridge()` when
+enumerating methods for frameworks.
+</Interview>
+
+<Interview question="Why does reflection sometimes fail on Java 17+ when it worked on Java 8?" level="senior">
+Strong encapsulation: JDK internals are no longer opened by default, so `setAccessible(true)` on a
+non-exported package throws `InaccessibleObjectException`. Fixes are to use public APIs, add
+`--add-opens` for the specific package, or upgrade the library. Blanket opening is a temporary
+workaround, not a design.
+</Interview>
+
+<Interview question="How do Spring's proxies interact with self-invocation?" level="senior">
+The proxy intercepts calls that arrive through it. A method calling another method on `this` inside
+the same bean bypasses the proxy, so `@Transactional` or `@Cacheable` on the callee is not applied.
+Solutions are to split the bean, inject a self-reference, or use `AopContext.currentProxy()` with
+exposing proxies enabled.
+</Interview>
+
+<Interview question="What is the difference between a JDK proxy and a CGLIB proxy?" level="mid">
+A JDK proxy implements interfaces and delegates to an `InvocationHandler`. A CGLIB/ByteBuddy proxy
+creates a subclass and overrides methods, so it can proxy concrete classes but not `final` classes
+or `final` methods. Spring chooses JDK proxies when interfaces exist and can be configured to always
+use class proxies.
+</Interview>
+
+<Interview question="When is annotation processing better than runtime reflection?" level="senior">
+At build time, when the metadata is static: it produces generated code or compile errors with no
+startup cost and no runtime access issues. Runtime reflection is for behaviour that must adapt to
+classes discovered later, such as dependency injection or JSON binding. Many modern frameworks use
+both — processors for wiring, reflection for edge cases.
+</Interview>
+</InterviewSet>

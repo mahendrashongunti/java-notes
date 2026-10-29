@@ -1,0 +1,285 @@
+---
+title: "The Object Model and Dynamic Dispatch"
+description: "What the compiler decides, what the JVM decides at runtime, and why overriding, hiding and interface dispatch behave differently."
+order: 1
+difficulty: advanced
+tags: ["polymorphism", "dispatch", "inheritance", "interfaces"]
+updated: "2026-10-18"
+sources:
+  - title: "JLS §8.4.8 — Inheritance, Overriding, and Hiding (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html"
+    note: "Override rules for return type, access and checked exceptions."
+  - title: "JLS §15.12.4 — Runtime Evaluation of Method Invocation (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html"
+    note: "How the JVM selects the method body at runtime."
+  - title: "JVMS §2 — The Structure of the Java Virtual Machine (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html"
+  - title: "Dev.java — Object-Oriented Programming"
+    href: "https://dev.java/learn/language/oop/"
+---
+
+<Lead>
+Most Java bugs around inheritance are not syntax errors — they are assumptions about *when* a
+decision gets made. This chapter separates the two moments: compile-time resolution, which picks a
+signature, and runtime dispatch, which picks an implementation.
+</Lead>
+
+## Two decisions, not one
+
+A method call in Java is resolved twice.
+
+1. **Compile time.** The compiler looks at the *static type* of the receiver and the argument
+   types, then picks a method signature. This is the only moment overloading is considered.
+2. **Runtime.** The JVM looks at the *dynamic type* of the receiver and picks the most specific
+   override of that signature.
+
+```java
+class Animal {
+    void speak() { System.out.println("animal"); }
+}
+
+class Dog extends Animal {
+    @Override void speak() { System.out.println("dog"); }
+}
+
+Animal a = new Dog();
+a.speak(); // dog — the static type picks the signature, the runtime type picks the body
+```
+
+That split explains a whole family of "obvious" questions:
+
+| Expression | Static type | Dynamic type | Prints |
+| --- | --- | --- | --- |
+| `new Animal().speak()` | `Animal` | `Animal` | `animal` |
+| `((Animal) new Dog()).speak()` | `Animal` | `Dog` | `dog` |
+| `Animal a = null; a.speak()` | `Animal` | — | `NullPointerException` |
+
+<Callout type="java" title="Why the cast does not matter">
+Casting changes only the *static* type the compiler sees. It does not change the object. There is
+no "convert to `Animal`" step — the reference still points at a `Dog` instance and dispatch still
+finds `Dog.speak`.
+</Callout>
+
+## How dispatch is implemented
+
+Every class carries a method table — a per-class array of pointers to the implementations of its
+virtual methods. Interfaces use a variant of the same idea (`itable` plus an offset table for
+default methods). The call site does not contain the target address; it contains an index into the
+receiver's table.
+
+<Diagram title="Invokevirtual, conceptually" caption="The offset is fixed at link time; the table entry is chosen by the receiver's class.">
+{`Animal a = new Dog();
+a.speak();
+
+  compiled call site            receiver              dispatch target
+  ─────────────────             ────────              ───────────────
+  invokevirtual #7   ───────►   Dog instance   ─────► Dog.speak()
+  (slot 2 of Animal's vtable)   [ vtable ──┐            (slot 2 overridden)
+                                            └──────►  Animal.speak()   ← not used
+                                                      Object.toString()  ← other slots`}
+</Diagram>
+
+Because the slot index is fixed by the *declaring* type, the JVM never searches by name at runtime.
+A subclass that overrides a method writes a new pointer into the same slot. This is why dispatch is
+constant time even with deep hierarchies.
+
+<Callout type="warning" title="This is why `private` and `static` do not dispatch">
+Only instance methods participate in this table. `private`, `static` and `final` methods are bound
+statically or inlined, so they cannot be overridden — even if a subclass declares something with
+an identical signature.
+</Callout>
+
+## Overriding: the rules that actually bite
+
+An override is legal only if the new method is *substitutable* for the old one.
+
+| Rule | Legal | Illegal |
+| --- | --- | --- |
+| Name and parameter types | identical | `speak(String)` overloads, it does not override |
+| Return type | same or covariant | returning a supertype |
+| Access modifier | same or wider | `protected` → `private` |
+| Checked exceptions | same, fewer, or narrower | adding a new checked exception |
+| Type parameters | identical after erasure | `<T> void f(T)` vs `void f(String)` |
+
+```java
+class Parent {
+    protected Number value() throws IOException { return 1; }
+}
+
+class Child extends Parent {
+    @Override public Integer value() { return 2; }   // wider access, covariant return, no checked exception
+}
+```
+
+The overload case is the one that surprises people:
+
+```java
+class Parent { void handle(Object o) { System.out.println("parent"); } }
+class Child extends Parent {
+    void handle(String s) { System.out.println("child"); }  // overload, NOT override
+}
+
+Parent p = new Child();
+p.handle("text"); // parent — String is widened to Object for the compile-time signature
+```
+
+<Callout type="danger" title="Always add `@Override`">
+Without the annotation the compiler silently accepts an accidental overload. With it, the compiler
+fails and tells you that no method was overridden. There is no downside to writing it everywhere.
+</Callout>
+
+## Bridge methods, or why javap shows methods you never wrote
+
+Generics are erased, but overriding must still work through generic supertypes. The compiler
+synthesises a *bridge method* to keep dispatch correct.
+
+```java
+class Box<T> { T get() { return null; } }
+class StringBox extends Box<String> {
+    @Override String get() { return "value"; }
+}
+```
+
+`javap -c StringBox` shows two methods:
+
+```text
+java.lang.String get();
+java.lang.Object get();   // bridge: casts to String, calls the real get()
+```
+
+The bridge exists so a call through `Box` — whose erased signature returns `Object` — lands on
+`StringBox.get()`. If you call `StringBox.class.getDeclaredMethods()` and see duplicate methods,
+this is why. Bridge methods are synthetic and `isBridge()` returns `true`.
+
+## Fields are not polymorphic
+
+Fields are resolved by the static type and hidden, never overridden. Two fields with the same name
+can coexist in one object.
+
+```java
+class Parent { String name = "parent"; String who() { return name; } }
+class Child extends Parent { String name = "child"; }
+
+Parent p = new Child();
+System.out.println(p.name);    // parent — field access uses the static type
+System.out.println(p.who());   // parent — who() reads Parent.name
+```
+
+`who()` is inherited, not overridden, so it executes against `Parent`'s view of the object, where
+`name` is still `"parent"`. This is a strong argument for private fields and accessor methods.
+
+## Static methods hide, they do not override
+
+```java
+class Parent { static void hello() { System.out.println("parent"); } }
+class Child extends Parent { static void hello() { System.out.println("child"); } }
+
+Parent p = new Child();
+p.hello(); // parent — resolved entirely at compile time from the static type
+```
+
+Calling a static method through an instance is legal and misleading; IDEs flag it. Treat static
+methods as belonging to the type, not the object, and never call them through a reference.
+
+## `default` methods and the diamond problem
+
+Interfaces can supply implementations. When two interfaces both provide a default for the same
+signature, the compiler refuses to guess.
+
+```java
+interface A { default String greet() { return "A"; } }
+interface B { default String greet() { return "B"; } }
+
+class C implements A, B {
+    @Override public String greet() {
+        return A.super.greet() + B.super.greet();  // must disambiguate explicitly
+    }
+}
+```
+
+Rules, in order:
+
+1. A class method wins over any interface default.
+2. The most specific interface wins: if `B extends A`, `B`'s default is chosen.
+3. An unrelated pair is a compile error until the class overrides the method.
+
+<Callout type="note" title="Defaults are not multiple inheritance of state">
+Interfaces still cannot hold instance fields. Default methods are behaviour without state, which is
+why the diamond is resolvable at all.
+</Callout>
+
+## Substitution, not reuse
+
+Inheritance is a promise that a subclass can be used wherever the supertype is expected — the
+Liskov substitution principle. The classic violation is a mutable value type:
+
+```java
+class Counter { int count; void increment() { count++; } }
+class StepCounter extends Counter {
+    @Override void increment() { count += 2; }
+}
+
+void run(Counter c) {
+    c.increment();
+    assert c.count == 1; // false for a StepCounter
+}
+```
+
+The caller's contract is broken even though the code compiles. If the relationship is "has a" or
+"uses a", prefer composition; if the type is genuinely closed, prefer `final` or a sealed hierarchy.
+
+```java
+final class StepCounter {
+    private final Counter counter;   // composition: no substitution surprise
+    private final int step;
+    StepCounter(int step) { this.counter = new Counter(); this.step = step; }
+    void increment() { counter.add(step); }
+}
+```
+
+<KeyPoints>
+- Compile time picks a *signature* using the static type; runtime picks a *body* using the dynamic type.
+- Overloading is compile-time and does not dispatch; overriding is runtime and must be substitutable.
+- Fields and static methods are resolved from the static type; they hide rather than override.
+- Bridge methods are compiler-generated and exist to make generic overriding work after erasure.
+- Interface defaults follow specificity rules; an ambiguous pair must be disambiguated with `X.super.m()`.
+- Prefer composition, `final` classes and sealed hierarchies when inheritance is not modelling a true is-a relationship.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="What is dynamic dispatch, and when does Java not use it?" level="mid">
+Dynamic dispatch is the runtime selection of an overriding method based on the receiver's actual
+class, normally through a per-class method table. Java skips it for `static`, `private` and `final`
+methods, for field access, and for constructors — those are bound at compile time or inlined.
+Bridges and default methods are still dispatched, just through interface tables.
+</Interview>
+
+<Interview question="Can you override a method and reduce its visibility?" level="junior">
+No. An override may keep or widen visibility but never narrow it, because a caller holding the
+supertype reference must still be able to invoke the method. `protected` → `public` is legal;
+`public` → `protected` is a compile error. The same substitutability rule governs return types
+(covariant only) and checked exceptions (no new ones).
+</Interview>
+
+<Interview question="Why does `List<String>` produce two `get` methods in a compiled subclass?" level="senior">
+Type erasure removes the type argument from the superclass signature, so a generic override would
+not match after erasure. The compiler emits a synthetic bridge method with the erased signature
+that casts and delegates to the real override. It is marked `ACC_BRIDGE | ACC_SYNTHETIC`, so
+reflection-based frameworks that enumerate methods must filter it out.
+</Interview>
+
+<Interview question="Two interfaces define the same default method. What happens?" level="mid">
+If the implementing class does not override it, compilation fails because neither interface is more
+specific. The class must override the method and can delegate explicitly using
+`First.super.method()` and `Second.super.method()`. If one interface extends the other, the more
+specific default wins and no override is required. A superclass method always beats an interface
+default.
+</Interview>
+
+<Interview question="How can inheritance break a caller's assumptions even when it compiles?" level="senior">
+By violating the supertype's contract — strengthening preconditions, weakening postconditions, or
+changing observable behaviour such as a method that mutates state differently. The canonical
+example is a subclass that changes `increment()` semantics. The fix is to design for extension
+(document contracts, prefer `final`, use sealed types) or to replace inheritance with composition.
+</Interview>
+</InterviewSet>

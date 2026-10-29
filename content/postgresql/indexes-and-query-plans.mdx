@@ -1,0 +1,177 @@
+---
+title: "Indexes and Query Plans"
+description: "B-tree mechanics, selectivity, composite index order, and how to read EXPLAIN ANALYZE without guessing."
+order: 1
+difficulty: advanced
+tags: ["PostgreSQL", "indexes", "EXPLAIN", "SQL"]
+updated: "2026-10-21"
+sources:
+  - title: "PostgreSQL 17 — Indexes"
+    href: "https://www.postgresql.org/docs/17/indexes.html"
+  - title: "PostgreSQL 17 — Using EXPLAIN"
+    href: "https://www.postgresql.org/docs/17/using-explain.html"
+    note: "Reading plans, costs, row estimates and actual timing."
+  - title: "PostgreSQL 17 — Performance Tips"
+    href: "https://www.postgresql.org/docs/17/performance-tips.html"
+---
+
+<Lead>
+An index is a sorted structure with a cost model attached. Understanding the structure explains
+which predicates can use it; reading the plan explains what the planner actually chose.
+</Lead>
+
+## B-tree basics
+
+PostgreSQL's default index is a B-tree: balanced, sorted, with leaf pages linked for range scans.
+
+```sql
+CREATE INDEX idx_orders_customer_created
+    ON orders (customer_id, created_at DESC);
+```
+
+Supported by that index:
+
+- `WHERE customer_id = ?` — leading column.
+- `WHERE customer_id = ? AND created_at > ?` — equality then range.
+- `ORDER BY customer_id, created_at DESC` — matches the index order.
+
+Not supported efficiently:
+
+- `WHERE created_at > ?` alone — the leading column is missing.
+- `WHERE lower(email) = ?` — the expression is not indexed (use an expression index).
+- `WHERE status = 'x'` when almost every row matches — a scan is cheaper.
+
+## Composite index order is not arbitrary
+
+The rule of thumb: equality columns first, then the range/sort column, then included columns.
+
+```sql
+-- query: recent orders for one customer
+SELECT id, total FROM orders
+WHERE customer_id = 42 AND created_at >= now() - interval '30 days'
+ORDER BY created_at DESC;
+
+CREATE INDEX idx_orders_customer_created
+    ON orders (customer_id, created_at DESC)
+    INCLUDE (total);
+```
+
+`INCLUDE` columns are stored in the leaf but not the key, enabling an index-only scan when the
+visibility map is current.
+
+<Callout type="warning" title="Indexes cost writes">
+Every index must be updated on insert, update and delete, and consumes cache. A table with eight
+indexes writes nine structures per row. Drop indexes that no query uses; `pg_stat_user_indexes.idx_scan`
+shows usage.
+</Callout>
+
+## Reading EXPLAIN ANALYZE
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT * FROM orders WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 20;
+```
+
+```text
+Limit  (cost=0.43..12.90 rows=20 width=64) (actual time=0.041..0.087 rows=20 loops=1)
+  ->  Index Scan using idx_orders_customer_created on orders
+        (cost=0.43..1284.10 rows=240 width=64) (actual time=0.039..0.079 rows=20 loops=1)
+        Index Cond: (customer_id = 42)
+        Buffers: shared hit=6
+```
+
+Read it inside out and compare estimated `rows` to `actual rows`:
+
+| Symptom | Meaning | Action |
+| --- | --- | --- |
+| estimated ≪ actual | stale statistics | `ANALYZE`, raise statistics target |
+| `Seq Scan` on a large table with a selective filter | missing or unusable index | add the index, check the predicate |
+| `Rows Removed by Filter: 900000` | index used but not selective enough | better composite order, or partial index |
+| `Buffers: shared read` high | cold cache | warm up, check working set |
+| Nested loop with large outer rows | bad join order estimate | ANALYZE, consider `enable_nestloop` experiments |
+
+`cost` is an arbitrary unit, not milliseconds. Only `actual time` is measured, and only with
+`ANALYZE`.
+
+## Selectivity and partial indexes
+
+An index on a column whose values repeat heavily (a status flag) is often useless: the planner
+prefers a sequential scan for a large fraction of rows. A partial index makes the small subset
+cheap:
+
+```sql
+CREATE INDEX idx_orders_pending ON orders (created_at)
+    WHERE status = 'PENDING';
+```
+
+The predicate must appear in the query for the planner to use it. This works well for queues,
+soft-deleted rows and "active" flags.
+
+## Common query traps
+
+```sql
+-- non-sargable: the function hides the column
+WHERE date_trunc('day', created_at) = '2026-01-01'
+-- rewrite
+WHERE created_at >= '2026-01-01' AND created_at < '2026-01-02'
+
+-- type mismatch defeats the index
+WHERE customer_id = '42'      -- if customer_id is integer, use 42
+
+-- leading wildcard cannot use a B-tree
+WHERE email LIKE '%@acme.com'
+-- use a trigram index instead
+CREATE INDEX idx_users_email_trgm ON users USING gin (email gin_trgm_ops);
+```
+
+Other index types: `GIN` for arrays/JSONB/full-text, `GiST` for ranges and geometry, `BRIN` for
+huge append-only tables with natural correlation.
+
+## Transactions and locking, briefly
+
+PostgreSQL uses MVCC: readers do not block writers. `UPDATE` takes a row lock; two transactions
+updating the same row serialise, and the second waits. Long transactions prevent vacuum from
+reclaiming dead tuples, so table bloat is a transaction-duration problem as much as a write problem.
+
+```sql
+SELECT * FROM orders WHERE id = 42 FOR UPDATE;         -- row lock
+SELECT * FROM orders WHERE id = 42 FOR UPDATE SKIP LOCKED;  -- queue pattern
+```
+
+`SKIP LOCKED` is how you build a work queue in the database without contention.
+
+<KeyPoints>
+- B-tree supports leading-column equality, then ranges and sorts in index order.
+- Composite order: equality columns first, range/sort last, covering columns in `INCLUDE`.
+- Compare estimated to actual rows; stale statistics are the most common plan problem.
+- Low-selectivity predicates rarely benefit from a plain index; use partial indexes.
+- Functions and casts around a column prevent index use unless indexed as expressions.
+- Every index taxes writes; measure usage with `pg_stat_user_indexes`.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="Why doesn't my index get used?" level="senior">
+Common reasons: the predicate is not sargable (function or cast on the column), the leading column
+is missing from a composite index, the query returns too large a fraction of the table so a scan is
+cheaper, statistics are stale, or the column type mismatches the literal. Check with `EXPLAIN
+(ANALYZE, BUFFERS)` and `pg_stat_statements` rather than assuming.
+</Interview>
+
+<Interview question="What is a covering index in PostgreSQL?" level="mid">
+An index that contains every column the query needs, so the heap is not visited. Postgres does this
+with `INCLUDE` columns and an index-only scan, which also requires the visibility map to be
+sufficiently current — otherwise it falls back to heap fetches.
+</Interview>
+
+<Interview question="How do you index a case-insensitive email lookup?" level="junior">
+Either store a normalised lowercase column, or create an expression index:
+`CREATE INDEX ON users (lower(email))` and query with `WHERE lower(email) = lower($1)`. A trigram
+GIN index is the right tool for `LIKE '%...%'` searches.
+</Interview>
+
+<Interview question="Why do long transactions hurt write performance?" level="senior">
+MVCC keeps dead tuples until no transaction can see them. A long-running transaction holds back the
+xmin horizon, so vacuum cannot reclaim space, tables and indexes bloat, and plans degrade. Monitor
+`pg_stat_activity` for long idle-in-transaction sessions and set `idle_in_transaction_session_timeout`.
+</Interview>
+</InterviewSet>

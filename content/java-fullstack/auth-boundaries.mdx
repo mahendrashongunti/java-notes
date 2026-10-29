@@ -1,0 +1,136 @@
+---
+title: "Authentication Boundaries in a Java Fullstack App"
+description: "Where sessions, cookies, tokens and CSRF checks belong once a Spring backend meets a browser."
+order: 1
+difficulty: intermediate
+tags: ["auth", "Spring Security", "cookies", "CSRF"]
+updated: "2026-10-22"
+sources:
+  - title: "OWASP Application Security Verification Standard"
+    href: "https://owasp.org/www-project-application-security-verification-standard/"
+  - title: "OWASP Authorization Cheat Sheet"
+    href: "https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html"
+    note: "Server-side enforcement and object-level checks."
+  - title: "RFC 6749 — The OAuth 2.0 Authorization Framework"
+    href: "https://www.rfc-editor.org/rfc/rfc6749.html"
+  - title: "Spring Security Reference"
+    href: "https://docs.spring.io/spring-security/reference/index.html"
+---
+
+<Lead>
+Most auth bugs are boundary bugs: the credential is stored in the wrong place, validated at the
+wrong layer, or sent to an origin that should never have received it.
+</Lead>
+
+## Three storage choices
+
+| Storage | Survives reload | XSS risk | CSRF risk |
+| --- | --- | --- | --- |
+| `HttpOnly` cookie | yes | not readable by JS | needs CSRF defence |
+| `localStorage` token | yes | readable by any injected script | none if header-only |
+| In-memory variable | no | lower | none |
+
+For a same-origin fullstack app, an `HttpOnly`, `Secure`, `SameSite=Lax` session cookie is the
+safest default: JavaScript cannot read it, and `SameSite` blocks most cross-site requests. For
+cross-origin APIs, short-lived access tokens plus a refresh cookie are common, but the complexity is
+real — you now own rotation, revocation and storage.
+
+<Callout type="danger" title="Never put a long-lived token in localStorage">
+One XSS — a dependency, a rendered markdown field, an inline script — exfiltrates it, and you cannot
+revoke it without server-side state. Cookies with `HttpOnly` remove that exfiltration path.
+</Callout>
+
+## CSRF is about ambient credentials
+
+CSRF works because the browser attaches cookies automatically. If the credential travels in an
+`Authorization` header that JavaScript sets, a cross-site form post cannot supply it.
+
+```java
+http
+  .csrf(csrf -> csrf
+      .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
+      .ignoringRequestMatchers("/api/webhooks/**"))
+  .sessionManagement(session -> session
+      .sessionFixation().migrateSession()
+      .maximumSessions(1));
+```
+
+For cookie-based auth, keep CSRF enabled. `SameSite=Lax` reduces but does not eliminate the risk
+(top-level `POST` navigations, older browsers). For stateless bearer-token APIs, disable CSRF for
+those routes and make sure the token is never accepted from a cookie.
+
+## Where to enforce authorisation
+
+Authentication says who you are; authorisation says what you may do. Enforce authorisation on the
+server at the resource boundary, not in the UI.
+
+```java
+@PreAuthorize("hasRole('ADMIN') or #userId == authentication.name")
+public Account account(String userId) { ... }
+```
+
+Rules that prevent the classic bugs:
+
+- Never trust an id from the client for ownership checks; derive the tenant/user from the
+  authenticated principal.
+- Apply the check on every entry point — REST, GraphQL, scheduled jobs, message consumers.
+- Scope database queries by tenant in the query itself, not after loading.
+- Treat UI hiding as cosmetic. Hiding a button is not an access control.
+
+## Session and token lifecycle
+
+- Rotate the session id on login to prevent fixation.
+- Set short idle and absolute timeouts; store sessions server-side or in a signed, encrypted cookie.
+- On logout, invalidate server-side state — deleting a cookie is not revocation.
+- Access tokens should be short-lived; refresh tokens need rotation, reuse detection and binding.
+- Never log tokens, cookies or `Authorization` headers. Scrub them in error reporting too.
+
+## The frontend boundary
+
+The browser can only be trusted with a session, never with a secret. Anything in the bundle is
+public: API keys, internal hostnames, feature flags for authorisation.
+
+```ts
+// server-rendered page or BFF route
+const session = await getSession(cookies());
+if (!session) redirect("/login");
+
+// the token stays server-side; the browser only holds the cookie
+const res = await fetch(`${API}/orders`, {
+  headers: { Authorization: `Bearer ${session.accessToken}` },
+});
+```
+
+A backend-for-frontend keeps tokens out of the browser, centralises refresh, and makes the API
+same-origin from the browser's perspective. The cost is an extra hop and another deployable.
+
+<KeyPoints>
+- Prefer `HttpOnly`, `Secure`, `SameSite=Lax` cookies for same-origin apps.
+- CSRF applies to ambient cookie credentials; bearer headers are not automatically attached.
+- Authorise at the resource boundary and derive identity from the principal, never from client ids.
+- Rotate session ids on login and invalidate server-side state on logout.
+- Keep access tokens short-lived, refresh tokens rotating and revocable.
+- Treat the frontend bundle as public; keep secrets in a BFF or server route.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="Why is an HttpOnly cookie safer than localStorage for sessions?" level="mid">
+JavaScript cannot read an `HttpOnly` cookie, so an XSS payload cannot exfiltrate it. A token in
+`localStorage` is readable by any script on the origin. The cookie introduces CSRF risk, which is
+handled with `SameSite` and CSRF tokens; that is a narrower, well-understood problem.
+</Interview>
+
+<Interview question="When can you safely disable CSRF protection?" level="senior">
+When the credential is not sent automatically by the browser — for example an `Authorization` header
+set by your own client — and the API does not accept cookies for authentication. If a cookie is
+accepted anywhere on those routes, CSRF protection must stay on. Also consider whether CORS
+misconfiguration could let another origin read responses.
+</Interview>
+
+<Interview question="How do you prevent horizontal privilege escalation?" level="senior">
+Derive the tenant and user from the authenticated principal, then scope every query by that id at
+the database level (`WHERE tenant_id = ?`). Never accept an ownership id from the request body
+without checking it against the principal, and apply the same rule in every entry point, including
+background consumers.
+</Interview>
+</InterviewSet>

@@ -1,0 +1,178 @@
+---
+title: "Idempotency, Retries and Failure Budgets"
+description: "How to make a write safe to repeat, why retries amplify outages, and where to put the boundary."
+order: 1
+difficulty: advanced
+tags: ["idempotency", "retries", "reliability", "API design"]
+updated: "2026-10-19"
+sources:
+  - title: "RFC 9110 — HTTP Semantics"
+    href: "https://www.rfc-editor.org/rfc/rfc9110.html"
+    note: "Idempotent and safe methods, and what a server may assume on retry."
+  - title: "AWS Builders' Library — Timeouts, Retries and Backoff with Jitter"
+    href: "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"
+    note: "Retry amplification and why jitter matters."
+  - title: "Google SRE Book — Handling Overload"
+    href: "https://sre.google/sre-book/handling-overload/"
+    note: "Client-side throttling and load shedding as backpressure."
+---
+
+<Lead>
+Every network call can succeed without you hearing about it. Idempotency is the discipline that
+makes the retry — automated or human — safe.
+</Lead>
+
+## The failure you cannot distinguish
+
+A client sends `POST /payments`. The server charges the card, then the connection drops before the
+response. The client sees a timeout. Did the charge happen?
+
+```text
+client ──POST /payments──► server
+        ◄─── timeout ─────┐
+                          └─ charge committed, response lost
+```
+
+Without an idempotency key, retrying risks a double charge. With one, the server can recognise the
+repeat and return the original result.
+
+## Idempotency keys
+
+```http
+POST /payments
+Idempotency-Key: 9f3c2a41-8a1e-4a0e-9a1e-1f0d2c3b4a55
+
+{"amount": 4999, "currency": "INR", "customer": "cus_123"}
+```
+
+The server stores the key with a fingerprint of the request and the eventual response.
+
+| State | Behaviour |
+| --- | --- |
+| key unseen | process, store `IN_PROGRESS` |
+| key seen, same fingerprint, completed | return the stored response |
+| key seen, same fingerprint, in progress | return 409 or wait briefly |
+| key seen, different fingerprint | return 422 — key reuse is a client bug |
+
+Design notes that matter:
+
+- The key must come from the client, not be derived from the payload (two legitimate identical
+  payments are possible).
+- Store the response body and status, not just "done".
+- Expire keys after a window longer than the client's retry horizon — 24 hours is typical, longer for
+  financial operations.
+- Insert the key with a unique constraint so concurrent duplicates lose the race deterministically.
+
+```sql
+INSERT INTO idempotency_keys (key, fingerprint, status)
+VALUES ($1, $2, 'IN_PROGRESS')
+ON CONFLICT (key) DO NOTHING
+RETURNING id;
+```
+
+## HTTP semantics you get for free
+
+| Method | Safe | Idempotent |
+| --- | --- | --- |
+| `GET`, `HEAD` | yes | yes |
+| `PUT`, `DELETE` | no | yes |
+| `POST` | no | no — needs a key |
+| `PATCH` | no | not necessarily |
+
+`PUT` is idempotent *by contract*: sending the same representation twice leaves the same state. It is
+not automatically safe under concurrency — last-write-wins may still lose an update. Use versioning
+(ETag / `If-Match`) for that.
+
+## Retries amplify
+
+Retries help with transient, independent failures. They hurt when the failure is caused by
+overload: every retry adds load to an already struggling dependency.
+
+```text
+attempt 1 ──► timeout
+attempt 2 ──► timeout  (dependency now at 2× load)
+attempt 3 ──► timeout
+```
+
+Rules that keep retries from becoming a denial-of-service:
+
+- Retry only idempotent operations, or those protected by a key.
+- Retry only transient failures: timeouts, 429, 502/503/504. Never retry 400/401/403/422.
+- Exponential backoff with jitter. Fixed delays synchronise clients into thundering herds.
+- Cap attempts and total elapsed time, and respect `Retry-After`.
+- Use a circuit breaker so a failing dependency fails fast instead of absorbing retries.
+
+```java
+var policy = RetryPolicy.<Response>builder()
+        .handle(IOException.class, TransientException.class)
+        .withBackoff(Duration.ofMillis(200), Duration.ofSeconds(5), 2.0)
+        .withJitter(0.3)
+        .withMaxAttempts(4)
+        .withMaxDuration(Duration.ofSeconds(10))
+        .build();
+```
+
+## Timeouts, deadlines and cancellation
+
+A timeout without propagation is incomplete. The caller's deadline should travel with the request so
+downstream work can stop early.
+
+```java
+try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    scope.fork(() -> inventory.reserve(id, deadline));
+    scope.fork(() -> payments.authorise(id, deadline));
+    scope.joinUntil(deadline);
+    scope.throwIfFailed();
+}
+```
+
+Beware of retries under a deadline: four retries with a two-second timeout need more than the
+eight-second budget the caller allowed.
+
+<Callout type="warning" title="Exactly-once is a distributed-systems myth">
+You get at-most-once or at-least-once delivery. Durable idempotency plus deduplication is how you
+build effectively-once processing. Design consumers to tolerate duplicates.
+</Callout>
+
+## Making consumers idempotent
+
+- Store processed message ids with a unique constraint.
+- Make state transitions conditional (`UPDATE ... WHERE status = 'PENDING'`), not blind writes.
+- Prefer upserts with natural keys over inserts with generated ids when replaying.
+- Use outbox tables so publishing and state change commit atomically.
+
+<KeyPoints>
+- A lost response makes success indistinguishable from failure; idempotency keys close that gap.
+- Store the response, not just a completion flag, and bind the key to a request fingerprint.
+- `PUT`/`DELETE` are idempotent by contract; `POST` needs an explicit key.
+- Retry transient failures only, with jittered exponential backoff and a total deadline.
+- Retries during overload multiply load; pair them with a circuit breaker.
+- Exactly-once delivery does not exist — build effectively-once consumers with deduplication.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="How would you implement idempotent payment creation?" level="senior">
+Require a client-supplied idempotency key, insert it with a unique constraint and an IN_PROGRESS
+status, execute the charge, then persist the response against the key. Concurrent duplicates either
+see IN_PROGRESS (409/retry) or the stored response. Reject the same key with a different request
+fingerprint. Expire keys after the retry horizon.
+</Interview>
+
+<Interview question="Which HTTP methods are idempotent, and does that make them safe?" level="mid">
+`GET`/`HEAD` are safe and idempotent; `PUT` and `DELETE` are idempotent but not safe. Idempotency
+concerns repeated identical requests, not concurrency: two `PUT`s with different bodies still race,
+so use ETags or version columns for optimistic concurrency.
+</Interview>
+
+<Interview question="Why add jitter to exponential backoff?" level="senior">
+Without jitter, clients that failed together retry together, producing periodic spikes that keep
+the dependency down. Randomised jitter spreads retries over the window, smoothing load and
+increasing the chance that some requests succeed.
+</Interview>
+
+<Interview question="How do you stop retries from causing an outage?" level="senior">
+Bound attempts and total time, retry only transient errors, use backoff with jitter, honour
+`Retry-After`, and add a circuit breaker that opens after a failure threshold. Also apply retry
+budgets so a service cannot spend more than a fraction of its capacity on retries.
+</Interview>
+</InterviewSet>

@@ -1,0 +1,221 @@
+---
+title: "Lambdas and Functional Interfaces"
+description: "Target typing, capture rules, method references and what invokedynamic actually generates."
+order: 6
+difficulty: intermediate
+tags: ["lambdas", "functional-interfaces", "method-references", "streams"]
+updated: "2026-10-23"
+sources:
+  - title: "JLS §15 — Expressions (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html"
+    note: "Lambda expressions, target typing and method references."
+  - title: "java.util.function package (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/function/package-summary.html"
+  - title: "Dev.java — Functional Programming"
+    href: "https://dev.java/learn/language/fp/"
+---
+
+<Lead>
+A lambda is not an object literal and not quite an anonymous class. It is an implementation of a
+functional interface, produced by `invokedynamic`, with its own rules for `this` and for what it may
+capture.
+</Lead>
+
+## Functional interfaces and target typing
+
+A functional interface has exactly one abstract method (default and static methods do not count).
+`@FunctionalInterface` is a compile-time assertion, not a requirement.
+
+```java
+@FunctionalInterface
+interface PriceRule {
+    BigDecimal apply(BigDecimal price);
+
+    default PriceRule andThen(PriceRule next) {
+        return price -> next.apply(this.apply(price));
+    }
+}
+```
+
+A lambda has no type of its own. The compiler infers it from the *target type* — an assignment, a
+parameter, a return type or a cast.
+
+```java
+PriceRule tenPercent = price -> price.multiply(new BigDecimal("0.90"));
+
+// same lambda, different interface — legal because the shape matches
+Function<BigDecimal, BigDecimal> fn = price -> price.multiply(new BigDecimal("0.90"));
+```
+
+This is why lambdas cannot be used with `var` alone (`var f = x -> x;` has no target) and why
+overloaded methods taking different functional interfaces can become ambiguous.
+
+## `this` and capture
+
+Inside a lambda, `this` refers to the enclosing instance. Inside an anonymous class, `this` refers
+to the anonymous class itself. That difference matters when calling instance methods.
+
+```java
+class Report {
+    private final String title = "Q3";
+
+    Runnable lambda() {
+        return () -> System.out.println(this.title);       // Report.this
+    }
+
+    Runnable anonymous() {
+        return new Runnable() {
+            @Override public void run() {
+                // System.out.println(this.title);          // does not compile
+            }
+        };
+    }
+}
+```
+
+Lambdas capture variables, not values of `this`. Captured locals must be final or effectively
+final — the compiler copies the value into the lambda's synthetic field at creation time.
+
+```java
+int base = 100;                       // effectively final
+IntUnaryOperator addBase = value -> value + base;
+// base++;                            // compile error if uncommented
+```
+
+If you need mutable state, use a field, an `AtomicInteger`, or an array — but prefer a stream
+reduction. Mutation from a lambda inside a parallel stream is a data race.
+
+## Method references
+
+| Form | Example | Equivalent lambda |
+| --- | --- | --- |
+| static | `Integer::parseInt` | `s -> Integer.parseInt(s)` |
+| bound instance | `System.out::println` | `x -> System.out.println(x)` |
+| unbound instance | `String::length` | `s -> s.length()` |
+| constructor | `ArrayList::new` | `() -> new ArrayList<>()` |
+| array constructor | `int[]::new` | `n -> new int[n]` |
+
+Unbound references take the receiver as the first parameter, which is why
+`Comparator.comparing(String::length)` works.
+
+## The `java.util.function` catalogue
+
+| Interface | Shape | Typical use |
+| --- | --- | --- |
+| `Function<T,R>` | `T -> R` | mapping, conversion |
+| `BiFunction<T,U,R>` | `(T,U) -> R` | combining two values |
+| `UnaryOperator<T>` | `T -> T` | in-place transforms |
+| `Predicate<T>` | `T -> boolean` | filtering |
+| `Consumer<T>` | `T -> void` | side effects, logging |
+| `Supplier<T>` | `() -> T` | lazy values, factories |
+| `Runnable` / `Callable<T>` | `() -> void` / `() -> T` | concurrency |
+
+Primitive specialisations (`IntFunction`, `ToLongFunction`, `IntPredicate`, …) exist to avoid
+boxing in hot paths — `mapToInt` instead of `map` followed by unboxing.
+
+Composition is where these interfaces earn their place:
+
+```java
+Predicate<String> blank = String::isBlank;
+Predicate<String> tooLong = value -> value.length() > 40;
+Predicate<String> invalid = blank.or(tooLong);
+
+Function<String, String> normalise = String::strip;
+Function<String, String> lower = value -> value.toLowerCase(Locale.ROOT);
+Function<String, String> clean = normalise.andThen(lower);   // left to right
+
+Comparator<Order> byDate = Comparator.comparing(Order::createdAt).reversed();
+```
+
+## Lambdas versus anonymous classes
+
+| | Lambda | Anonymous class |
+| --- | --- | --- |
+| `this` | enclosing instance | the anonymous instance |
+| State | captured values only | can declare fields |
+| Methods | one abstract method | any number |
+| Implementation | `invokedynamic` + `LambdaMetafactory` | a generated class |
+| Identity | may be cached; `==` unreliable | new instance per evaluation |
+
+The identity point is subtle: the JVM may reuse the same lambda instance for a non-capturing
+lambda, so never rely on reference equality or per-instance identity.
+
+<Callout type="java" title="Why invokedynamic">
+`javac` emits an `invokedynamic` instruction whose bootstrap method is `LambdaMetafactory`. At first
+execution the JVM spins up a class implementing the interface and links the call site. This avoids a
+class file per lambda and allows future runtime strategies. With `-Djava.lang.invoke.stringConcat`
+era changes and `-Djdk.internal.lambda.disableEagerInitialization`, the details differ, but the
+observable semantics are stable.
+</Callout>
+
+## Checked exceptions in lambdas
+
+Functional interfaces do not declare checked exceptions (except `Callable`). A lambda that throws
+`IOException` cannot be used where a `Function` is expected, which is the usual friction when
+rewriting loops as streams.
+
+```java
+// Function<Path, String> read = path -> Files.readString(path);  // does not compile
+
+@FunctionalInterface
+interface ThrowingFunction<T, R> {
+    R apply(T value) throws Exception;
+
+    static <T, R> Function<T, R> unchecked(ThrowingFunction<T, R> fn) {
+        return value -> {
+            try {
+                return fn.apply(value);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        };
+    }
+}
+```
+
+Prefer a plain loop when the body is exception-heavy; clarity beats a stream pipeline that fights
+the type system.
+
+<KeyPoints>
+- A lambda implements a functional interface whose single abstract method matches its shape; its type comes from the target.
+- `this` inside a lambda is the enclosing instance, unlike an anonymous class.
+- Captured locals must be effectively final; the value is copied when the lambda is created.
+- Method references have four forms: static, bound, unbound and constructor.
+- Lambdas may be cached by the JVM, so identity comparisons are meaningless.
+- Checked exceptions need a custom throwing interface plus an unchecked wrapper, or a plain loop.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="Is a lambda an object?" level="mid">
+It evaluates to an instance of a functional interface, but it is not written as a class. `javac`
+emits `invokedynamic` and `LambdaMetafactory` creates the implementation at runtime. The object has
+no meaningful identity and may be reused when it captures nothing.
+</Interview>
+
+<Interview question="Why must captured variables be effectively final?" level="senior">
+The lambda may outlive the stack frame that declared the variable, so the compiler copies the value
+into a synthetic field at creation time. Allowing later mutation would create a confusing split
+between the local and the captured copy — and a data race if the lambda runs on another thread.
+Fields and array elements are not captured this way, which is why they can still mutate.
+</Interview>
+
+<Interview question="What is the difference between `map` and `flatMap`?" level="junior">
+`map` transforms each element one-to-one, producing `Stream<R>`. `flatMap` transforms each element
+into a stream and concatenates the results, so it is used when the function returns a collection or
+`Optional` — it flattens one level.
+</Interview>
+
+<Interview question="How does a method reference differ from calling the method?" level="senior">
+A method reference is a deferred implementation of a functional interface, not an invocation. The
+receiver and arguments are supplied when the interface method is called. For unbound references,
+the first parameter becomes the receiver; for bound references, the receiver is fixed at creation
+time.
+</Interview>
+
+<Interview question="Why can't a lambda throw a checked exception?" level="mid">
+The functional interface it implements declares no checked exceptions, and the lambda must be
+compatible with that signature. Either use an interface that declares the exception (like
+`Callable`), wrap it in an unchecked exception, or keep the code in a normal method that declares
+the checked exception.
+</Interview>
+</InterviewSet>

@@ -1,0 +1,174 @@
+---
+title: "Choosing a Collection (and the Complexity Behind It)"
+description: "ArrayList versus LinkedList in practice, set and queue choices, and the iterator contracts people trip over."
+order: 2
+difficulty: intermediate
+tags: ["ArrayList", "LinkedList", "collections", "complexity"]
+updated: "2026-10-22"
+sources:
+  - title: "java.util package (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/package-summary.html"
+    note: "The collection interfaces and their contracts."
+  - title: "java.util.Map (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/Map.html"
+  - title: "Dev.java — Collections and Streams"
+    href: "https://dev.java/learn/api/collections-and-streams/"
+---
+
+<Lead>
+The complexity table is the start of the decision, not the end. Cache locality, allocation rate and
+iterator contracts usually decide which collection is actually faster.
+</Lead>
+
+## The table worth memorising
+
+| Operation | `ArrayList` | `LinkedList` | `ArrayDeque` | `HashMap` | `TreeMap` |
+| --- | --- | --- | --- | --- | --- |
+| `get(i)` | O(1) | O(n) | — | O(1) avg | O(log n) |
+| `add(last)` | O(1) amortised | O(1) | O(1) amortised | O(1) avg | O(log n) |
+| `add(0, x)` | O(n) | O(1) | O(1) at head | — | — |
+| `remove(i)` | O(n) | O(n) | — | O(1) avg by key | O(log n) |
+| `contains` | O(n) | O(n) | O(n) | O(1) avg | O(log n) |
+| iteration | fast, contiguous | pointer chasing | contiguous | bucket walk | in-order walk |
+
+`LinkedList.remove(int)` is O(n) despite the O(1) unlink: finding the node requires a walk. That is
+why "LinkedList is better for insertion" is only true when you already hold the `ListIterator` at
+the position.
+
+## Why `ArrayList` usually wins even where `LinkedList` looks better
+
+An `ArrayList` stores elements in one contiguous `Object[]`. Iteration is a linear scan with
+hardware prefetching. A `LinkedList` allocates a node per element, scattered in memory, and every
+step is a pointer dereference and a likely cache miss.
+
+```java
+List<Integer> list = new ArrayList<>();       // 4 bytes-ish per reference, contiguous
+List<Integer> linked = new LinkedList<>();    // node object + 3 references per element
+```
+
+For queue behaviour, use `ArrayDeque`, not `LinkedList`: it is faster, has no per-element node, and
+supports both ends. `LinkedList` remains useful mainly when you need a `Deque` and also implement
+`List`, which is rare.
+
+## Sets
+
+| Need | Use | Note |
+| --- | --- | --- |
+| Membership, no order | `HashSet` | backed by `HashMap` |
+| Insertion order | `LinkedHashSet` | deterministic iteration |
+| Sorted, ranges | `TreeSet` | `NavigableSet`, O(log n) |
+| Enum members | `EnumSet` | bit vector, extremely compact |
+| Preserve insertion + fast membership | `LinkedHashSet` | slightly more memory than `HashSet` |
+
+`EnumSet` is the one people skip and should not: it is a long bitmask, so `contains` is O(1) with no
+hashing and memory is a fraction of `HashSet`.
+
+## Queues and deques
+
+`ArrayDeque` is the default for stacks and queues. `PriorityQueue` is a binary heap: `peek` is O(1),
+`offer`/`poll` are O(log n), and iteration is **not** sorted.
+
+```java
+Deque<Task> stack = new ArrayDeque<>();
+stack.push(task);          // addFirst
+stack.pop();               // removeFirst
+
+Queue<Task> queue = new ArrayDeque<>();
+queue.offer(task);         // addLast
+queue.poll();              // removeFirst
+
+PriorityQueue<Task> byPriority = new PriorityQueue<>(Comparator.comparing(Task::priority));
+```
+
+`PriorityQueue` is not thread-safe; `PriorityBlockingQueue` is the concurrent variant, and
+`DelayQueue` handles scheduled expiry.
+
+## Immutable and fixed-size factories
+
+```java
+List<String> immutable = List.of("a", "b");        // unmodifiable, rejects nulls
+List<String> fixed = Arrays.asList("a", "b");      // fixed size, set() allowed, nulls allowed
+List<String> copy = List.copyOf(mutableList);      // snapshot, unmodifiable
+```
+
+`Arrays.asList` is a view over the array: `set` writes through, `add`/`remove` throw
+`UnsupportedOperationException`. `List.of` is truly immutable. Neither is a good target for
+`Collections.sort` when immutability is the goal; sort a copy.
+
+## Fail-fast iterators
+
+`ArrayList`, `HashMap` and friends track a `modCount`. Structural modification during iteration
+throws `ConcurrentModificationException` on the next `next()` call — best effort, not a guarantee.
+
+```java
+for (String item : items) {
+    if (item.isBlank()) items.remove(item);     // ConcurrentModificationException
+}
+```
+
+```java
+items.removeIf(String::isBlank);                // correct, single pass
+Iterator<String> it = items.iterator();
+while (it.hasNext()) {
+    if (it.next().isBlank()) it.remove();       // also correct
+}
+```
+
+`removeIf` on `ArrayList` is especially efficient because it compacts in place. The fail-fast
+behaviour is not a concurrency mechanism: for shared mutable collections, use a concurrent
+collection or external synchronisation.
+
+## Streams and collectors
+
+```java
+List<String> names = people.stream().map(Person::name).toList();   // unmodifiable, nulls allowed
+Map<String, Long> countByCity = people.stream()
+        .collect(Collectors.groupingBy(Person::city, Collectors.counting()));
+```
+
+`Stream.toList()` returns an unmodifiable list and permits nulls; `Collectors.toList()` returns a
+mutable `ArrayList` (with no guarantee on type). `Collectors.toUnmodifiableList()` rejects nulls.
+Choose deliberately — passing a `toList()` result into code that sorts it will throw.
+
+<KeyPoints>
+- `ArrayList` is the default list; contiguous memory beats `LinkedList`'s O(1) unlink in practice.
+- `ArrayDeque` is the default queue/stack; `PriorityQueue` iterates unsorted.
+- `EnumSet` and `EnumMap` are the right choices for enum keys.
+- `Arrays.asList` is fixed-size and array-backed; `List.of` is immutable and null-hostile.
+- Never structurally modify a collection during a for-each; use `removeIf` or the iterator.
+- `Stream.toList()` is unmodifiable; `Collectors.toList()` is mutable.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="When is LinkedList actually the right choice?" level="mid">
+Almost never. It wins only when you are doing many insertions/removals at positions you already
+hold via a `ListIterator`, and even then `ArrayDeque` usually beats it for deque operations. Its
+per-node allocation and cache-unfriendly traversal make it slower than `ArrayList` for typical
+workloads.
+</Interview>
+
+<Interview question="What does fail-fast mean, and is it guaranteed?" level="senior">
+Iterators check a modification counter and throw `ConcurrentModificationException` when they detect
+a structural change. It is best-effort: the check happens on `next()`/`remove()`, so unsynchronised
+concurrent modification may go undetected. It is a bug detector, not a concurrency control.
+</Interview>
+
+<Interview question="How does ArrayList grow?" level="junior">
+It starts with a default capacity of 10 (or an empty array when constructed with no capacity) and
+grows to `oldCapacity + oldCapacity >> 1` — roughly 1.5× — copying into a new array. Amortised
+`add` is O(1), but individual resizes are O(n), so pre-size when the count is known.
+</Interview>
+
+<Interview question="Why is HashMap.get O(1) but HashSet.contains also O(1)?" level="junior">
+A `HashSet` is backed by a `HashMap` whose values are a shared sentinel. Membership is a key lookup:
+hash, bucket, then `equals` within the chain. Average O(1), worst case O(log n) after treeification
+or O(n) with a pathological hash in older implementations.
+</Interview>
+
+<Interview question="How would you pick a collection for a read-heavy concurrent cache?" level="senior">
+`ConcurrentHashMap` for the map itself, with immutable values and `computeIfAbsent` for atomic
+population. If bounded size and eviction are required, a dedicated cache library (Caffeine) is
+better than hand-rolling LRU with `LinkedHashMap`, which is not thread-safe. Reads should avoid
+locking entirely; writes should be short and idempotent.
+</Interview>
+</InterviewSet>

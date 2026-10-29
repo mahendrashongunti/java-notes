@@ -1,0 +1,5 @@
+{
+  "title": "Advanced Core Java",
+  "description": "Dispatch, generics, equality, immutability, exceptions, lambdas, streams, reflection and modern pattern matching — the semantics interviewers assume you know.",
+  "order": 1
+}

@@ -1,0 +1,229 @@
+---
+title: "Immutability, Strings and Safe Publication"
+description: "Why String is special, what the constant pool really shares, and how final fields make an object safely publishable."
+order: 4
+difficulty: advanced
+tags: ["immutability", "String", "final", "JMM"]
+updated: "2026-10-21"
+sources:
+  - title: "JLS §17 — Threads and Locks (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html"
+    note: "Final field semantics and safe publication (§17.5)."
+  - title: "java.lang.String (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/String.html"
+---
+
+<Lead>
+Immutability is not a style preference in Java — it is the cheapest route to thread safety. `String`
+is the language's showcase, and its implementation details explain a lot of production behaviour:
+memory, comparison bugs, and that one `+` inside a loop.
+</Lead>
+
+## What immutability actually requires
+
+1. All fields are `final` (or never mutated after construction).
+2. No mutable state is reachable from the object — every reference field is either immutable or
+   defensively copied.
+3. `this` does not escape during construction.
+4. The class is `final`, or its constructor is private with static factories.
+
+```java
+public final class DateRange {
+    private final LocalDate start;
+    private final LocalDate end;
+
+    public DateRange(LocalDate start, LocalDate end) {
+        if (start.isAfter(end)) throw new IllegalArgumentException("start after end");
+        this.start = start;      // LocalDate is immutable, no copy needed
+        this.end = end;
+    }
+
+    public LocalDate start() { return start; }
+    public LocalDate end() { return end; }
+    public boolean contains(LocalDate date) {
+        return !date.isBefore(start) && !date.isAfter(end);
+    }
+}
+```
+
+Because the fields are `final` and set in the constructor, the Java Memory Model guarantees that a
+thread which sees the reference also sees the fully constructed object — even without
+synchronisation, provided the reference itself is published safely. This is the *final field
+freeze* rule.
+
+<Callout type="danger" title="`this` escaping in a constructor">
+Registering a listener, starting a thread, or putting `this` into a collection inside the
+constructor publishes a partially constructed object. Another thread can observe default field
+values. Build first, publish afterwards.
+</Callout>
+
+## Defensive copies and unmodifiable views
+
+`Collections.unmodifiableList` is a *view*: the underlying list can still change underneath it.
+`List.copyOf` takes a *snapshot* and rejects nulls.
+
+```java
+List<String> source = new ArrayList<>(List.of("a", "b"));
+List<String> view = Collections.unmodifiableList(source);
+List<String> copy = List.copyOf(source);
+
+source.add("c");
+
+view.size();  // 3 — the view reflects the change
+copy.size();  // 2 — the copy is independent
+```
+
+For an immutable value object, copy on the way in and return either the copy or an unmodifiable
+view you control:
+
+```java
+public final class Team {
+    private final List<String> members;
+    public Team(List<String> members) { this.members = List.copyOf(members); }
+    public List<String> members() { return members; }   // already immutable
+}
+```
+
+`List.copyOf` itself is safe to share: it is unmodifiable and does not expose the source.
+
+## String: literals, the pool and identity
+
+String literals are interned in the class-file constant pool and resolved to a single canonical
+instance per JVM.
+
+```java
+String a = "java";
+String b = "java";
+String c = new String("java");
+String d = c.intern();
+
+a == b;        // true  — same pool entry
+a == c;        // false — new String always allocates
+a == d;        // true  — intern() returns the canonical instance
+a.equals(c);   // true  — always compare content with equals
+```
+
+Compile-time constant expressions are folded and interned too:
+
+```java
+String e = "ja" + "va";   // folded to "java" by javac, so e == a
+String f = "ja" + a.substring(2);  // runtime concatenation, new object
+```
+
+<Callout type="warning" title="Never compare strings with `==`">
+`==` compares references. It appears to work for literals and then fails for values read from a
+database, a JSON parser or a request parameter. Use `equals`, or `equalsIgnoreCase` when case does
+not matter, and put the constant first if null is possible: `"admin".equals(role)`.
+</Callout>
+
+## Inside String: compact strings and concatenation
+
+Since Java 9, `String` stores a `byte[]` plus a `coder` flag: Latin-1 text uses one byte per
+character, anything else uses two. `length()` still reports characters, but memory for ASCII-heavy
+applications roughly halved.
+
+Concatenation with `+` compiles to a `StringBuilder` (or `invokedynamic` with
+`StringConcatFactory` in modern JVMs), which allocates a builder per expression. Inside a loop that
+is quadratic:
+
+```java
+String result = "";
+for (String word : words) {
+    result += word + ",";        // new builder + new String every iteration
+}
+```
+
+```java
+StringBuilder builder = new StringBuilder();
+for (String word : words) {
+    builder.append(word).append(',');
+}
+String result = builder.toString();
+```
+
+`StringBuilder` is not thread-safe; `StringBuffer` synchronises every operation and is rarely the
+right answer. For joining known elements, `String.join` or `Collectors.joining` is clearer.
+
+`substring` has copied characters since JDK 7u6 — the old "substring keeps the parent array alive"
+leak is no longer true, but the copy cost remains.
+
+## Text blocks and modern helpers
+
+```java
+String query = """
+        SELECT id, name
+        FROM users
+        WHERE tenant_id = ?
+        """;
+```
+
+The closing delimiter controls indentation. Text blocks are still compile-time constants when the
+content is constant, and `String.formatted` is the modern replacement for `String.format` chains.
+
+Other useful methods: `isBlank`, `strip` (Unicode-aware, unlike `trim`), `lines`, `repeat`,
+`indent`, `transform`.
+
+## Immutability in the JDK
+
+| Immutable | Mutable counterpart | Note |
+| --- | --- | --- |
+| `String` | `StringBuilder` | pool + `intern()` |
+| `Integer`, `Long`, … | `AtomicInteger` | caches `-128..127` |
+| `LocalDate`, `Instant` | `java.util.Date`, `Calendar` | prefer `java.time` |
+| `List.of`, `Map.of` | `ArrayList`, `HashMap` | reject nulls, unmodifiable |
+| `record` with immutable components | class with setters | value semantics |
+
+```java
+Integer a = 127, b = 127;
+Integer c = 128, d = 128;
+a == b;  // true  — cached
+c == d;  // false — outside the cache, distinct instances
+```
+
+This is why boxed equality must always use `equals`, and why autoboxing in hot loops is a
+performance trap.
+
+<KeyPoints>
+- Immutability needs final fields, no reachable mutable state, no `this` escape, and no subclassing.
+- Final fields plus safe publication give visibility guarantees without locks.
+- `unmodifiableList` is a live view; `List.copyOf` is an independent snapshot that rejects nulls.
+- String literals are interned; `new String` allocates; always compare with `equals`.
+- Use `StringBuilder` or `Collectors.joining` for loops; `+` allocates per iteration.
+- Boxed primitives cache only `-128..127`; never compare them with `==`.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="Why is String immutable, and what would break if it were not?" level="mid">
+Immutability makes the constant pool safe to share, lets strings be used as map keys and in security
+checks without copying, and makes them inherently thread-safe. If strings were mutable, interning
+would let one piece of code change a value another piece depends on, and `hashCode` caching would
+be invalid.
+</Interview>
+
+<Interview question="What is the difference between `List.copyOf` and `Collections.unmodifiableList`?" level="senior">
+`unmodifiableList` wraps the original and forbids writes through the wrapper, but the original
+reference can still mutate and the wrapper reflects it. `List.copyOf` creates a new unmodifiable
+list holding the elements at that moment, rejects nulls, and shares no state with the source.
+Use the copy for defensive snapshots.
+</Interview>
+
+<Interview question="How do final fields help with visibility across threads?" level="senior">
+The JMM's final field semantics guarantee that a thread which reads a reference to a correctly
+constructed object sees the values assigned to its final fields in the constructor, without
+additional synchronisation. This requires that `this` did not escape during construction. Without
+`final`, another thread could observe default values even after the reference is visible.
+</Interview>
+
+<Interview question="Why is `+` in a loop slow, and when is it fine?" level="mid">
+Each iteration creates a builder, appends, and materialises a new String, so the work is quadratic
+in the number of iterations and allocates heavily. It is fine for a fixed handful of concatenations
+in one expression, including logging arguments that are only evaluated when the level is enabled.
+</Interview>
+
+<Interview question="What does `intern()` do and when would you use it?" level="senior">
+It returns the canonical instance from the string pool, adding the current string if absent. It can
+reduce memory when many identical strings are retained, at the cost of a native pool lookup and
+possible contention. Use it for a bounded set of repeated identifiers, not for arbitrary user input
+— pre-Java 7 interned strings lived in the permanent generation and could exhaust it.
+</Interview>
+</InterviewSet>

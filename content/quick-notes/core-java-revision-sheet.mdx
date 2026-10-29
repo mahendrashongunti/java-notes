@@ -1,0 +1,122 @@
+---
+title: "Core Java Revision Sheet"
+description: "The rules, tables and gotchas to re-read an hour before an interview."
+order: 1
+difficulty: intermediate
+tags: ["revision", "cheatsheet", "core java"]
+updated: "2026-10-27"
+sources:
+  - title: "JLS §17 — Threads and Locks (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html"
+  - title: "JVMS §2 — The Structure of the Java Virtual Machine (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html"
+  - title: "java.util.HashMap (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/HashMap.html"
+---
+
+<Lead>
+One page, no prose. If a line here is not obvious, follow the link into the full chapter.
+</Lead>
+
+## Dispatch
+
+| Thing | Resolved by |
+| --- | --- |
+| Overloaded method | compile-time, static type |
+| Overridden method | runtime, dynamic type |
+| Field | static type, hiding not overriding |
+| `static` method | static type, hiding |
+| `private`/`final` method | static, no dispatch |
+
+- `@Override` always — it turns accidental overloads into compile errors.
+- Override rules: same params, covariant return, same-or-wider access, no new checked exceptions.
+- Bridge methods are synthetic; filter with `isBridge()` in reflection.
+
+## Generics
+
+- Invariant: `List<Integer>` is not a `List<Number>`.
+- PECS: `? extends T` read, `? super T` write.
+- Erasure: `T` → `Object`, `T extends Number` → `Number`.
+- Illegal after erasure: `new T[]`, `instanceof List<String>`, static `T`, overloads on type args.
+- Varargs generics need `@SafeVarargs` and a no-write guarantee.
+
+## Equality
+
+- `equals`: reflexive, symmetric, transitive, consistent, null-safe.
+- `hashCode` equal for equal objects; collisions allowed.
+- Use `getClass()` or make the class final; `instanceof` plus subclasses breaks symmetry.
+- Mutable map keys break lookups.
+- Records: component-wise equality; arrays need overrides and defensive copies.
+
+## Strings and immutability
+
+- Literals interned; `new String` allocates; compare with `equals`.
+- `+` in a loop is quadratic — use `StringBuilder` / `Collectors.joining`.
+- `substring` copies since JDK 7u6.
+- `List.copyOf` snapshots; `unmodifiableList` is a live view.
+- Final fields + no `this` escape ⇒ safe publication.
+
+## Exceptions
+
+- Checked = recoverable contract; unchecked = bug; `Error` = JVM.
+- try-with-resources closes in reverse order; close failures become suppressed.
+- Always pass the cause; log once at the boundary.
+- Don't use exceptions for control flow.
+
+## Collections
+
+| Need | Use |
+| --- | --- |
+| List, random access | `ArrayList` |
+| Queue/stack | `ArrayDeque` |
+| Ordered map | `LinkedHashMap` |
+| Sorted map | `TreeMap` |
+| Concurrent map | `ConcurrentHashMap` |
+| Enum keys | `EnumMap` / `EnumSet` |
+| Priority order | `PriorityQueue` |
+
+- `HashMap`: power-of-two table, `(n-1) & hash`, load factor 0.75, treeify at 8 / capacity 64.
+- `Arrays.asList` is fixed-size; `List.of` is immutable.
+- `Stream.toList()` is unmodifiable; `Collectors.toList()` is mutable.
+
+## Concurrency
+
+- `count++` is read-modify-write; needs atomicity.
+- `volatile` = visibility + ordering, not atomicity.
+- `synchronized` = mutual exclusion + visibility, reentrant.
+- happens-before edges: program order, monitor, volatile, start/join, final fields.
+- Deadlock: global lock order or `tryLock` timeouts.
+- Virtual threads: I/O scaling, not CPU parallelism; avoid pooling them.
+- Bounded queues + rejection policy beat unbounded queues.
+
+## JVM
+
+- Load → link (verify, prepare, resolve) → initialise (`<clinit>` once).
+- Parent-first delegation; type identity = name + defining loader.
+- Tiered compilation: interpreter → C1 → C2, deopt on broken assumptions.
+- G1 default; ZGC for sub-millisecond pauses on large heaps.
+- `OutOfMemoryError` message names the region: heap, metaspace, threads, direct buffers.
+
+## Modern Java
+
+```java
+sealed interface Shape permits Circle, Square {}
+record Circle(double r) implements Shape {}
+record Square(double s) implements Shape {}
+
+double area = switch (shape) {
+    case Circle(double r) -> Math.PI * r * r;
+    case Square(double s) -> s * s;
+};
+```
+
+- `sealed` subtypes must be `final`, `sealed` or `non-sealed`, in the same module.
+- Exhaustive switch over a sealed type needs no `default`; `case null` handles null.
+- Record patterns destructure by component order; `when` adds guards.
+- Text blocks preserve indentation relative to the closing delimiter.
+
+<KeyPoints>
+- If you remember one thing: compile time picks the signature, runtime picks the body.
+- If you remember two: `volatile` is visibility, `synchronized` is visibility plus atomicity.
+- If you remember three: indices are chosen by hash at insertion, so never mutate map keys.
+</KeyPoints>

@@ -1,0 +1,250 @@
+---
+title: "equals, hashCode and Records"
+description: "The contracts that collections rely on, the symmetry traps in inheritance, and what records generate for you."
+order: 3
+difficulty: advanced
+tags: ["equals", "hashCode", "records", "value-types"]
+updated: "2026-10-20"
+sources:
+  - title: "java.lang.Object (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Object.html"
+    note: "The equals and hashCode contracts."
+  - title: "java.lang.Record (JDK 21)"
+    href: "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Record.html"
+  - title: "JLS §8 — Classes (SE 21)"
+    href: "https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html"
+    note: "Record classes and the members they imply."
+---
+
+<Lead>
+`HashMap` is a hash table, so it trusts two methods completely. Break either contract and lookups
+fail in ways that look like framework bugs. Records remove most of the boilerplate, but not all of
+the thinking.
+</Lead>
+
+## The two contracts
+
+`equals` must be:
+
+- **reflexive** — `x.equals(x)` is true
+- **symmetric** — `x.equals(y)` iff `y.equals(x)`
+- **transitive** — if `x.equals(y)` and `y.equals(z)`, then `x.equals(z)`
+- **consistent** — same answer while the object is unchanged
+- **null-safe** — `x.equals(null)` is false, never throws
+
+`hashCode` must be consistent with it: if `a.equals(b)`, then
+`a.hashCode() == b.hashCode()`. The reverse is not required — collisions are legal and expected.
+
+## The inheritance symmetry trap
+
+```java
+class Point {
+    final int x, y;
+    Point(int x, int y) { this.x = x; this.y = y; }
+
+    @Override public boolean equals(Object o) {
+        if (!(o instanceof Point p)) return false;   // instanceof accepts subclasses
+        return p.x == x && p.y == y;
+    }
+}
+
+class ColorPoint extends Point {
+    final String color;
+    ColorPoint(int x, int y, String color) { super(x, y); this.color = color; }
+
+    @Override public boolean equals(Object o) {
+        return o instanceof ColorPoint cp && cp.color.equals(color) && super.equals(cp);
+    }
+}
+```
+
+```java
+Point p = new Point(1, 2);
+ColorPoint cp = new ColorPoint(1, 2, "red");
+
+p.equals(cp);  // true  — Point ignores colour
+cp.equals(p);  // false — ColorPoint requires a ColorPoint
+```
+
+The relationship is not symmetric. `getClass()` in `Point.equals` fixes symmetry but breaks
+substitutability for proxied or instrumented subclasses. The practical guidance:
+
+- value classes should be `final` (or records), which removes the problem entirely;
+- library classes that must allow subclassing should document that equality is exact-class and use
+  `getClass()`.
+
+<Callout type="danger" title="Records are implicitly final">
+A record cannot be extended, so the generated `equals` can use `instanceof` safely. That is one
+reason value semantics and inheritance are a poor mix.
+</Callout>
+
+## Writing equals by hand
+
+```java
+@Override
+public boolean equals(Object o) {
+    if (this == o) return true;                       // cheap identity check
+    if (!(o instanceof Money money)) return false;    // pattern variable, null-safe
+    return amount == money.amount && currency == money.currency;
+}
+
+@Override
+public int hashCode() {
+    return Objects.hash(amount, currency);            // or 31 * ... by hand
+}
+```
+
+For reference fields use `Objects.equals`, for arrays use `Arrays.equals` (and
+`Arrays.hashCode`), and for primitives use `==` (careful with `double` NaN and `-0.0`, where
+`Double.compare` is a better fit).
+
+## Why mutable keys break maps
+
+`HashMap` stores an entry in the bucket chosen from the key's hash *at insertion time*. Mutating the
+key afterwards moves its logical position without moving the entry.
+
+```java
+class Key {
+    int id;
+    Key(int id) { this.id = id; }
+    @Override public int hashCode() { return id; }
+    @Override public boolean equals(Object o) { return o instanceof Key k && k.id == id; }
+}
+
+Map<Key, String> map = new HashMap<>();
+Key key = new Key(1);
+map.put(key, "one");
+
+key.id = 2;
+map.get(key);        // null — hashCode now points at a different bucket
+map.containsKey(key); // false, yet the entry is still in the map
+```
+
+Every key should be immutable, or at least never change the fields used in `equals`/`hashCode`.
+This is also why the standard library's keys — `String`, `Integer`, `UUID`, `LocalDate` — are all
+immutable.
+
+## Records: what you get, what you must still write
+
+A record generates a canonical constructor, accessors, `equals`, `hashCode` and `toString` from its
+components. Equality is component-wise, using `==` for primitives and `equals` for references.
+
+```java
+record Point(int x, int y) {}
+
+record Range(int start, int end) {
+    Range {                                   // compact canonical constructor
+        if (start > end) throw new IllegalArgumentException("start > end");
+    }
+    int length() { return end - start; }
+    static Range of(int start, int end) { return new Range(start, end); }
+}
+```
+
+<Callout type="warning" title="Array components compare by reference">
+Records use `Objects.equals` on reference components, and arrays do not override `equals`. Two
+records holding equal arrays are therefore unequal by default. Store an immutable `List` instead,
+or override `equals`, `hashCode` and the accessor with a defensive copy.
+</Callout>
+
+```java
+record Tags(String[] values) {
+    Tags {
+        values = values.clone();              // defensive copy in
+    }
+    @Override public String[] values() {
+        return values.clone();                // defensive copy out
+    }
+    @Override public boolean equals(Object o) {
+        return o instanceof Tags t && Arrays.equals(values, t.values);
+    }
+    @Override public int hashCode() {
+        return Arrays.hashCode(values);
+    }
+}
+```
+
+Records can also be used with pattern matching, which is where they pay off most:
+
+```java
+sealed interface Shape permits Circle, Square {}
+record Circle(double radius) implements Shape {}
+record Square(double side) implements Shape {}
+
+static double area(Shape shape) {
+    return switch (shape) {
+        case Circle(double r) -> Math.PI * r * r;
+        case Square(double s) -> s * s;
+    };
+}
+```
+
+## Comparable is a different contract
+
+`compareTo` should be consistent with `equals`, but the JDK has deliberate exceptions:
+`BigDecimal("1.0").compareTo(BigDecimal("1.00"))` is `0` while `equals` is false. A
+`TreeSet<BigDecimal>` therefore keeps only one of them.
+
+```java
+record Version(int major, int minor) implements Comparable<Version> {
+    @Override public int compareTo(Version other) {
+        int result = Integer.compare(major, other.major);
+        return result != 0 ? result : Integer.compare(minor, other.minor);
+    }
+}
+```
+
+For anything you do not control, use `Comparator`:
+
+```java
+people.sort(Comparator.comparing(Person::lastName)
+                      .thenComparing(Person::firstName)
+                      .thenComparingInt(Person::age));
+```
+
+`Comparator.comparing` fails with a `NullPointerException` on null keys; use
+`Comparator.nullsFirst(...)` or filter first.
+
+<KeyPoints>
+- `equals` must be reflexive, symmetric, transitive, consistent and null-safe; `hashCode` must agree with it.
+- `instanceof` plus extensible value classes breaks symmetry; use `final` classes or records.
+- Mutating a map key after insertion makes the entry unreachable even though it is still present.
+- Records generate component-wise `equals`/`hashCode`/`toString`; arrays still need overrides and defensive copies.
+- A compact constructor is the single validation point for record invariants.
+- `compareTo` consistency with `equals` is a recommendation with real exceptions in the JDK.
+</KeyPoints>
+
+<InterviewSet>
+<Interview question="What happens if equals is correct but hashCode is not overridden?" level="junior">
+Equal objects can land in different buckets, so `HashMap.get`, `HashSet.contains` and similar
+lookups fail for an equal-but-distinct instance. `HashSet` may also store duplicates. The default
+`Object.hashCode` is identity-based, so overriding only `equals` is almost always a bug.
+</Interview>
+
+<Interview question="Why does HashMap use hashCode before equals?" level="mid">
+The hash narrows the search to one bucket, giving average O(1) lookup; `equals` then resolves
+collisions inside that bucket, which are O(1) on average and O(log n) since Java 8 when a bucket
+treeifies. Calling `equals` against every key would degrade to O(n).
+</Interview>
+
+<Interview question="How would you implement equals for a class that must allow subclassing?" level="senior">
+Options: make the class abstract and let concrete leaves implement equality; use `getClass()` and
+document exact-class semantics; or avoid the problem with composition/final classes. The
+`instanceof` form is only safe when the class is final, because a subclass can add state that the
+superclass cannot see, which breaks symmetry and transitivity.
+</Interview>
+
+<Interview question="Do records make defensive copying unnecessary?" level="mid">
+No. The generated canonical constructor stores references as given and the generated accessor
+returns them, so a mutable component such as an array or `Date` still leaks mutable state. Add a
+compact constructor that copies in and override the accessor to copy out, and override `equals` and
+`hashCode` if the component's default reference equality is wrong.
+</Interview>
+
+<Interview question="What is the difference between Comparable and Comparator?" level="junior">
+`Comparable` is the type's natural ordering, implemented by the type itself, used by
+`Collections.sort`, `TreeMap` and `TreeSet` by default. `Comparator` is an external strategy you can
+supply in as many variants as you need, composable with `thenComparing` and reversible with
+`reversed`. `compareTo` should generally agree with `equals`; comparators need no such constraint.
+</Interview>
+</InterviewSet>
